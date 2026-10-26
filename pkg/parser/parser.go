@@ -1,0 +1,75 @@
+//go:generate antlr -Xexact-output-dir -o fql -package fql -visitor -Dlanguage=Go antlr/FqlLexer.g4 antlr/FqlParser.g4
+//go:generate go run ./tools/patch_lexer.go
+package parser
+
+import (
+	antlr "github.com/antlr4-go/antlr/v4"
+
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+)
+
+type Parser struct {
+	tree    *fql.FqlParser
+	program *fql.ProgramContext
+}
+
+func New(query string, tr ...TokenStreamTransformer) *Parser {
+	input := antlr.NewInputStream(query)
+	// converts tokens to upper case, so now it doesn't matter
+	// in which case the tokens were entered
+	upper := newCaseChangingStream(input, true)
+	lexer := fql.NewFqlLexer(upper)
+
+	var stream antlr.TokenStream
+	stream = antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel)
+
+	// Apply all transformations to the token stream
+	for _, transform := range tr {
+		stream = transform(stream)
+	}
+
+	p := fql.NewFqlParser(stream)
+	p.BuildParseTrees = true
+
+	return &Parser{tree: p}
+}
+
+// Expression parses a standalone expression.
+func (p *Parser) Expression() fql.IExpressionContext {
+	return p.tree.Expression()
+}
+
+// AtEOF reports whether the parser consumed the complete input.
+func (p *Parser) AtEOF() bool {
+	return p.tree.GetCurrentToken().GetTokenType() == antlr.TokenEOF
+}
+
+func (p *Parser) GetLiteralNames() []string {
+	return p.tree.GetLiteralNames()[:]
+}
+
+func (p *Parser) AddErrorListener(listener antlr.ErrorListener) {
+	p.tree.AddErrorListener(listener)
+}
+
+func (p *Parser) RemoveErrorListeners() {
+	p.tree.RemoveErrorListeners()
+}
+
+// Program parses and returns the source program, caching the parse tree so
+// syntax diagnostics can be inspected before visitors consume it.
+func (p *Parser) Program() *fql.ProgramContext {
+	if p.program == nil {
+		p.program = p.tree.Program().(*fql.ProgramContext)
+	}
+
+	return p.program
+}
+
+func (p *Parser) Visit(visitor fql.FqlParserVisitor) interface{} {
+	return visitor.VisitProgram(p.Program())
+}
+
+func (p *Parser) Walk(listener fql.FqlParserListener) {
+	antlr.ParseTreeWalkerDefault.Walk(listener, p.Program())
+}

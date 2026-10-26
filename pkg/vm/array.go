@@ -1,0 +1,201 @@
+package vm
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/internal/operator"
+	"github.com/MontFerret/ferret/v2/pkg/internal/valueset"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+func arrayAll(ctx context.Context, cmp operator.ArrayComparator, left, right runtime.Value) (runtime.Boolean, error) {
+	arr, err := runtime.CastList(left)
+
+	if err != nil {
+		return runtime.False, err
+	}
+
+	op, ok := cmp.Binary()
+	if !ok {
+		return runtime.False, runtime.Errorf(runtime.ErrInvalidOperation, "invalid array comparator %d", cmp)
+	}
+
+	predicate, err := runtime.ResolveComparison(op)
+	if err != nil {
+		return runtime.False, err
+	}
+
+	result := runtime.True
+
+	if err := arr.ForEach(ctx, func(ctx context.Context, v runtime.Value, _ runtime.Int) (runtime.Boolean, error) {
+		matches, err := predicate(ctx, v, right)
+		if err != nil {
+			return runtime.False, err
+		}
+
+		if !matches {
+			result = runtime.False
+			return runtime.False, nil
+		}
+
+		return runtime.True, nil
+	}); err != nil {
+		return runtime.False, err
+	}
+
+	return result, nil
+}
+
+func arrayAny(ctx context.Context, cmp operator.ArrayComparator, left, right runtime.Value) (runtime.Boolean, error) {
+	arr, err := runtime.CastList(left)
+	if err != nil {
+		return runtime.False, err
+	}
+
+	op, ok := cmp.Binary()
+	if !ok {
+		return runtime.False, runtime.Errorf(runtime.ErrInvalidOperation, "invalid array comparator %d", cmp)
+	}
+
+	predicate, err := runtime.ResolveComparison(op)
+	if err != nil {
+		return runtime.False, err
+	}
+
+	result := runtime.False
+
+	if err := arr.ForEach(ctx, func(ctx context.Context, v runtime.Value, _ runtime.Int) (runtime.Boolean, error) {
+		matches, err := predicate(ctx, v, right)
+		if err != nil {
+			return runtime.False, err
+		}
+
+		if matches {
+			result = runtime.True
+
+			return runtime.False, nil
+		}
+
+		return runtime.True, nil
+	}); err != nil {
+		return runtime.False, err
+	}
+
+	return result, nil
+}
+
+func arrayNone(ctx context.Context, cmp operator.ArrayComparator, left, right runtime.Value) (runtime.Boolean, error) {
+	arr, err := runtime.CastList(left)
+	if err != nil {
+		return runtime.False, err
+	}
+
+	op, ok := cmp.Binary()
+	if !ok {
+		return runtime.False, runtime.Errorf(runtime.ErrInvalidOperation, "invalid array comparator %d", cmp)
+	}
+
+	predicate, err := runtime.ResolveComparison(op)
+	if err != nil {
+		return runtime.False, err
+	}
+
+	result := runtime.True
+
+	if err := arr.ForEach(ctx, func(ctx context.Context, v runtime.Value, _ runtime.Int) (runtime.Boolean, error) {
+		matches, err := predicate(ctx, v, right)
+		if err != nil {
+			return runtime.False, err
+		}
+
+		if matches {
+			result = runtime.False
+
+			return runtime.False, nil
+		}
+
+		return runtime.True, nil
+	}); err != nil {
+		return runtime.False, err
+	}
+
+	return result, nil
+}
+
+func arrayFlatten(ctx context.Context, value runtime.Value, depth int) (runtime.List, error) {
+	list, err := runtime.CastList(value)
+	if err != nil {
+		return nil, err
+	}
+
+	if depth < 1 {
+		return list, nil
+	}
+
+	size, err := list.Length(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := runtime.NewArray(runtime.CapacityHint(size, 2, 0))
+	var flatten func(input runtime.List, level int) error
+
+	flatten = func(input runtime.List, level int) error {
+		return input.ForEach(ctx, func(c context.Context, v runtime.Value, _ runtime.Int) (runtime.Boolean, error) {
+			if listValue, ok := v.(runtime.List); ok && level <= depth {
+				if err := flatten(listValue, level+1); err != nil {
+					return false, err
+				}
+
+				return true, nil
+			}
+
+			_ = result.Append(c, v)
+
+			return true, nil
+		})
+	}
+
+	if err := flatten(list, 1); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func arrayDistinct(ctx context.Context, value runtime.Value) (runtime.List, error) {
+	list, err := runtime.CastList(value)
+	if err != nil {
+		return nil, err
+	}
+
+	size, err := list.Length(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	capacity := runtime.CapacityHint(size, 1, 0)
+	result := runtime.NewArray(capacity)
+	seen := valueset.New(capacity)
+
+	err = list.ForEach(ctx, func(ctx context.Context, item runtime.Value, _ runtime.Int) (runtime.Boolean, error) {
+		added, err := seen.Add(ctx, item)
+		if err != nil {
+			return runtime.False, err
+		}
+
+		if added {
+			if err := result.Append(ctx, item); err != nil {
+				return runtime.False, err
+			}
+		}
+
+		return runtime.True, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}

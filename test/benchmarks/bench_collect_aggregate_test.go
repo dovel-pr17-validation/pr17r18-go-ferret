@@ -1,0 +1,146 @@
+package benchmarks_test
+
+import (
+	"testing"
+)
+
+const globalCollectAggregateQuery = `
+LET users = [
+	{ age: 31, salary: 75000 },
+	{ age: 25, salary: 60000 },
+	{ age: 36, salary: 80000 },
+	{ age: 69, salary: 95000 },
+	{ age: 45, salary: 70000 }
+]
+
+RETURN FOR u IN users
+	COLLECT AGGREGATE
+		minAge = MIN(u.age),
+		maxAge = MAX(u.age),
+		totalSalary = SUM(u.salary)
+	RETURN { minAge, maxAge, totalSalary }
+`
+
+const globalCollectAggregateLargeQuery = `
+LET values = 1..10000
+
+RETURN FOR v IN values
+	COLLECT AGGREGATE
+		cnt = COUNT(v),
+		sum = SUM(v),
+		min = MIN(v),
+		max = MAX(v),
+		avg = AVERAGE(v)
+	RETURN { cnt, sum, min, max, avg }
+`
+
+const globalCollectAggregateLargeIntoQuery = `
+LET values = 1..10000
+
+RETURN FOR v IN values
+	COLLECT AGGREGATE
+		sum = SUM(v),
+		min = MIN(v),
+		max = MAX(v)
+	INTO groups
+	RETURN { sum, min, max, groups }
+`
+
+const groupedCollectAggregateLargeQuery = `
+LET values = 1..10000
+
+RETURN FOR v IN values
+	COLLECT g = v % 100
+	AGGREGATE
+		cnt = COUNT(v),
+		sum = SUM(v),
+		min = MIN(v),
+		max = MAX(v),
+		avg = AVERAGE(v)
+	RETURN { g, cnt, sum, min, max, avg }
+`
+
+const genericGroupedCollectAggregateQuery = `
+RETURN FOR v IN 1..10000
+	COLLECT g = v % 100
+	AGGREGATE total = SUM(v), average = AVERAGE(v)
+	RETURN { g, total, average }
+`
+
+const genericGlobalCollectAggregateQuery = `
+RETURN FOR v IN 1..10000
+	COLLECT AGGREGATE total = SUM(v), median = MEDIAN(v)
+	RETURN { total, median }
+`
+
+func BenchmarkGlobalCollectAggregate_None(b *testing.B) {
+	RunBenchmarkNone(b, globalCollectAggregateQuery)
+}
+
+func BenchmarkGlobalCollectAggregate_Basic(b *testing.B) {
+	RunBenchmarkBasic(b, globalCollectAggregateQuery)
+}
+
+func BenchmarkGlobalCollectAggregate_Full(b *testing.B) {
+	RunBenchmarkFull(b, globalCollectAggregateQuery)
+}
+
+func BenchmarkGlobalCollectAggregateLarge_None(b *testing.B) {
+	RunBenchmarkNone(b, globalCollectAggregateLargeQuery)
+}
+
+func BenchmarkGlobalCollectAggregateLarge_Basic(b *testing.B) {
+	RunBenchmarkBasic(b, globalCollectAggregateLargeQuery)
+}
+
+func BenchmarkGlobalCollectAggregateLarge_Full(b *testing.B) {
+	RunBenchmarkFull(b, globalCollectAggregateLargeQuery)
+}
+
+func BenchmarkGlobalCollectAggregateLargeInto_None(b *testing.B) {
+	RunBenchmarkNone(b, globalCollectAggregateLargeIntoQuery)
+}
+
+func BenchmarkGlobalCollectAggregateLargeInto_Basic(b *testing.B) {
+	RunBenchmarkBasic(b, globalCollectAggregateLargeIntoQuery)
+}
+
+func BenchmarkGlobalCollectAggregateLargeInto_Full(b *testing.B) {
+	RunBenchmarkFull(b, globalCollectAggregateLargeIntoQuery)
+}
+
+func BenchmarkGroupedCollectAggregateLarge_None(b *testing.B) {
+	RunBenchmarkNone(b, groupedCollectAggregateLargeQuery)
+}
+
+func BenchmarkGroupedCollectAggregateLarge_Basic(b *testing.B) {
+	RunBenchmarkBasic(b, groupedCollectAggregateLargeQuery)
+}
+
+func BenchmarkGroupedCollectAggregateLarge_Full(b *testing.B) {
+	RunBenchmarkFull(b, groupedCollectAggregateLargeQuery)
+}
+
+func BenchmarkGenericGroupedCollectAggregate_None(b *testing.B) {
+	RunBenchmarkNone(b, genericGroupedCollectAggregateQuery)
+}
+
+func BenchmarkGenericGroupedCollectAggregate_Basic(b *testing.B) {
+	RunBenchmarkBasic(b, genericGroupedCollectAggregateQuery)
+}
+
+func BenchmarkGenericGroupedCollectAggregate_Full(b *testing.B) {
+	RunBenchmarkFull(b, genericGroupedCollectAggregateQuery)
+}
+
+func BenchmarkGenericGlobalCollectAggregate_None(b *testing.B) {
+	RunBenchmarkNone(b, genericGlobalCollectAggregateQuery)
+}
+
+func BenchmarkGenericGlobalCollectAggregate_Basic(b *testing.B) {
+	RunBenchmarkBasic(b, genericGlobalCollectAggregateQuery)
+}
+
+func BenchmarkGenericGlobalCollectAggregate_Full(b *testing.B) {
+	RunBenchmarkFull(b, genericGlobalCollectAggregateQuery)
+}

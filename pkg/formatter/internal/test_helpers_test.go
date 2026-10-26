@@ -1,0 +1,49 @@
+package internal
+
+import (
+	"testing"
+
+	"github.com/antlr4-go/antlr/v4"
+
+	"github.com/MontFerret/ferret/v2/pkg/parser"
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+)
+
+func defaultTestConfig() *Config {
+	config := DefaultConfig()
+
+	return &config
+}
+
+func parseProgram(t *testing.T, input string) *fql.ProgramContext {
+	t.Helper()
+
+	return parser.New(input).Program()
+}
+
+func mustFirst[T any](t *testing.T, tree antlr.Tree) T {
+	t.Helper()
+
+	value, ok := findFirst[T](tree)
+	if !ok {
+		t.Fatalf("failed to find node %T", value)
+	}
+	return value
+}
+
+func findFirst[T any](tree antlr.Tree) (T, bool) {
+	var zero T
+	if tree == nil {
+		return zero, false
+	}
+	if value, ok := tree.(T); ok {
+		return value, true
+	}
+	for i := 0; i < tree.GetChildCount(); i++ {
+		child := tree.GetChild(i)
+		if value, ok := findFirst[T](child); ok {
+			return value, true
+		}
+	}
+	return zero, false
+}

@@ -1,0 +1,32 @@
+package math
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// snapshotNumbers retains the native numeric types in independently owned
+// storage. No source copying, sorting, or random access is required.
+func snapshotNumbers(ctx context.Context, source runtime.List, policy numberPolicy) ([]runtime.Value, error) {
+	var values []runtime.Value
+
+	_, err := forEachNumber(ctx, source, policy, func(value runtime.Value, _ runtime.Int) {
+		values = append(values, value)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return values, nil
+}
+
+func sortNumbers(ctx context.Context, values []runtime.Value, ascending bool) error {
+	return runtime.SortSliceWith(ctx, values, func(c context.Context, left, right runtime.Value) (runtime.Ordering, error) {
+		if !ascending {
+			left, right = right, left
+		}
+
+		return runtime.CompareValues(c, left, right)
+	})
+}

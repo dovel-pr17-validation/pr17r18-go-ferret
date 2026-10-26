@@ -1,0 +1,120 @@
+package uapi
+
+import (
+	"context"
+
+	"github.com/MontFerret/api"
+
+	"github.com/MontFerret/ferret/v2/pkg/engine"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+)
+
+// Runtime adapts a Native engine to api.Runtime. Construct an owned engine with
+// New, or borrow an existing engine with Wrap.
+type Runtime struct {
+	native     *engine.Engine
+	version    api.Version
+	ownsEngine bool
+}
+
+var _ api.Runtime = (*Runtime)(nil)
+
+// New constructs and owns a Native engine using its options. Native handles
+// construction rollback; failures return a nil runtime and a projected error.
+// version identifies the Ferret Core implementation and is retained unchanged.
+// Callers must settle work and close sessions and plans before the runtime.
+func New(version api.Version, opts ...engine.Option) (*Runtime, error) {
+	native, err := engine.New(opts...)
+	if err != nil {
+		return nil, wrapDiagnosticError(err)
+	}
+
+	return &Runtime{native: native, version: version, ownsEngine: true}, nil
+}
+
+// Wrap borrows native without transferring ownership of it or its resources.
+// version identifies the Ferret Core implementation and is retained unchanged.
+// The caller must settle outstanding work and close its children before native.
+// Wrap panics when native is nil.
+func Wrap(native *engine.Engine, version api.Version) *Runtime {
+	if native == nil {
+		panic("uapi: nil native engine")
+	}
+
+	return &Runtime{native: native, version: version}
+}
+
+// Version returns the Ferret Core version supplied to New or Wrap unchanged,
+// including after Close. The context must be non-nil and not already canceled.
+func (r *Runtime) Version(ctx context.Context) (api.Version, error) {
+	if ctx == nil {
+		return "", runtime.Error(runtime.ErrInvalidArgument, "context is required")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	return r.version, nil
+}
+
+// Run delegates convenience execution and transient session/plan cleanup to
+// Native. Terminal failures and content are observed through the returned handle;
+// the invocation context must outlive consumption.
+func (r *Runtime) Run(ctx context.Context, src api.Source, setters ...api.SessionOption) (api.Output, error) {
+	opts, err := newSessionOptions(setters)
+	if err != nil {
+		return nil, wrapDiagnosticError(err)
+	}
+
+	output, err := r.native.Run(ctx, source.New(src.Name, src.Content), opts.native...)
+	if err != nil {
+		return nil, wrapDiagnosticError(err)
+	}
+
+	return &outputAdapter{native: output}, nil
+}
+
+// Compile translates portable compilation options and creates a reusable plan.
+// Omitted optimization inherits the Native engine's default.
+func (r *Runtime) Compile(ctx context.Context, src api.Source, setters ...api.PlanOption) (api.Plan, error) {
+	return r.compile(ctx, src, false, setters)
+}
+
+// CompileDebug creates a reusable plan with Native debugger metadata. Native
+// validates that explicit optimization is api.OptimizationNone.
+func (r *Runtime) CompileDebug(ctx context.Context, src api.Source, setters ...api.PlanOption) (api.Plan, error) {
+	return r.compile(ctx, src, true, setters)
+}
+
+// Close delegates to Native for an engine owned through New. Native retains the
+// cleanup result and rejects subsequent work; it does not settle outstanding work
+// or close caller-owned descendants. For Wrap, Close returns nil and leaves both
+// the adapter and borrowed engine usable.
+func (r *Runtime) Close() error {
+	if r.ownsEngine {
+		return wrapDiagnosticError(r.native.Close())
+	}
+
+	return nil
+}
+
+func (r *Runtime) compile(ctx context.Context, src api.Source, debug bool, setters []api.PlanOption) (api.Plan, error) {
+	opts, err := newPlanOptions(setters)
+	if err != nil {
+		return nil, wrapDiagnosticError(err)
+	}
+
+	compile := r.native.Compile
+	if debug {
+		compile = r.native.CompileDebug
+	}
+
+	native, err := compile(ctx, source.New(src.Name, src.Content), opts.native...)
+	if err != nil {
+		return nil, wrapDiagnosticError(err)
+	}
+
+	return newPlan(native), nil
+}

@@ -1,0 +1,21 @@
+package path
+
+import (
+	"context"
+	"path"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// base returns the last component of the path or the path itself if it does not contain any directory separators.
+// @param path {String} The path.
+// @return {String} The last component of the path.
+func Base(_ context.Context, arg runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgType(arg, 0, runtime.TypeString); err != nil {
+		return runtime.EmptyString, err
+	}
+
+	pathText := arg.String()
+
+	return runtime.NewString(path.Base(pathText)), nil
+}

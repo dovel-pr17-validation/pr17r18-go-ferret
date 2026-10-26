@@ -1,0 +1,66 @@
+package internal
+
+// CompilationFrontend is the compiler assembly root.
+// It owns construction and explicit wiring, but compilers must depend only on
+// their named collaborators rather than the frontend itself.
+type CompilationFrontend struct {
+	Session         *CompilationSession
+	Bindings        *BindingCompiler
+	Calls           *CallResolver
+	Collects        *CollectCompiler
+	Dispatch        *DispatchCompiler
+	Expressions     *ExprCompiler
+	Literals        *LiteralCompiler
+	Loops           *LoopCompiler
+	Recovery        *RecoveryCompiler
+	TypeFacts       *TypeFacts
+	CaptureAnalyzer *CaptureAnalyzer
+	Sorts           *LoopSortCompiler
+	Statements      *StatementCompiler
+	UDFCatalog      *UDFCatalogBuilder
+	UDFs            *UDFCompiler
+	Wait            *WaitCompiler
+	NameCollisions  *NameCollisionValidator
+	ForwardBindings *ForwardBindingIndex
+}
+
+func NewCompilationFrontend(session *CompilationSession) *CompilationFrontend {
+	front := &CompilationFrontend{
+		Session:         session,
+		Bindings:        NewBindingCompiler(session),
+		Calls:           NewCallResolver(session),
+		Expressions:     NewExprCompiler(session),
+		Literals:        NewLiteralCompiler(session),
+		Statements:      NewStatementCompiler(session),
+		Loops:           NewLoopCompiler(session),
+		Sorts:           NewLoopSortCompiler(session),
+		Collects:        NewCollectCompiler(session),
+		Wait:            NewWaitCompiler(session),
+		Dispatch:        NewDispatchCompiler(session),
+		NameCollisions:  NewNameCollisionValidator(session),
+		ForwardBindings: NewForwardBindingIndex(session),
+		TypeFacts:       NewTypeFacts(session),
+		CaptureAnalyzer: NewCaptureAnalyzer(session),
+		UDFs:            NewUDFCompiler(session),
+		UDFCatalog:      NewUDFCatalogBuilder(session),
+		Recovery:        NewRecoveryCompiler(session),
+	}
+
+	session.Program.ForwardBindings = front.ForwardBindings
+
+	front.Bindings.bind(front.Expressions, front.TypeFacts)
+	front.Literals.bind(front.Expressions, front.TypeFacts)
+	front.CaptureAnalyzer.bind(front.Bindings, front.Calls)
+	front.UDFCatalog.bind(front.Calls)
+	front.Sorts.bind(front.Expressions, front.TypeFacts)
+	front.Recovery.bind(front.Expressions, front.Literals, front.TypeFacts)
+	front.Dispatch.bind(front.Expressions, front.Literals, front.Recovery, front.TypeFacts)
+	front.Wait.bind(front.Bindings, front.Dispatch, front.Expressions, front.Literals, front.Recovery, front.TypeFacts)
+	front.Collects.bind(front.Bindings, front.Calls, front.Expressions, front.Recovery, front.TypeFacts)
+	front.Statements.bind(front.Bindings, front.Expressions, front.Loops, front.TypeFacts)
+	front.UDFs.bind(front.Statements)
+	front.Loops.bind(front.Bindings, front.Collects, front.Expressions, front.Literals, front.Recovery, front.Sorts, front.TypeFacts)
+	front.Expressions.bind(front.Bindings, front.Calls, front.Dispatch, front.Literals, front.Loops, front.Recovery, front.TypeFacts, front.Wait)
+
+	return front
+}

@@ -1,0 +1,66 @@
+package path_test
+
+import (
+	"context"
+	"testing"
+
+	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/path"
+)
+
+func TestDir(t *testing.T) {
+	Convey("Wrong argument", t, func() {
+		var err error
+		_, err = path.Dir(context.Background(), runtime.NewInt(0))
+
+		So(err, ShouldBeError)
+	})
+
+	Convey("Dir('pkg/path/dir.go') should return 'pkg/path'", t, func() {
+		out, _ := path.Dir(
+			context.Background(),
+			runtime.NewString("pkg/path/dir.go"),
+		)
+
+		So(out.String(), ShouldEqual, "pkg/path")
+	})
+
+	Convey("Dir('/') should return '/'", t, func() {
+		out, _ := path.Dir(
+			context.Background(),
+			runtime.NewString("/"),
+		)
+
+		So(out.String(), ShouldEqual, "/")
+	})
+
+	Convey("Dir('') should return '.'", t, func() {
+		out, _ := path.Dir(
+			context.Background(),
+			runtime.NewString(""),
+		)
+
+		So(out.String(), ShouldEqual, ".")
+	})
+
+	Convey("Dir('file') should return '.'", t, func() {
+		out, _ := path.Dir(
+			context.Background(),
+			runtime.NewString("file"),
+		)
+
+		So(out.String(), ShouldEqual, ".")
+	})
+
+	Convey("Dir('/a/b/c') should return '/a/b'", t, func() {
+		out, _ := path.Dir(
+			context.Background(),
+			runtime.NewString("/a/b/c"),
+		)
+
+		So(out.String(), ShouldEqual, "/a/b")
+	})
+}

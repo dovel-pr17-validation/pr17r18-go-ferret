@@ -1,0 +1,19 @@
+package math
+
+import (
+	"context"
+	"math"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// abs returns the absolute value of a given number.
+// @param number {Int | Float} Input number.
+// @return {Float} The absolute value of a given number.
+func Abs(_ context.Context, arg runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgValue(arg, 0, runtime.AssertNumber); err != nil {
+		return runtime.None, err
+	}
+
+	return runtime.NewFloat(math.Abs(toFloat(arg))), nil
+}

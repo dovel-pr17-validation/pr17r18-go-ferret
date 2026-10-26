@@ -1,0 +1,284 @@
+package compiler_test
+
+import (
+	"fmt"
+	"runtime"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/compiler"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+)
+
+func TestCompiler_Consts(t *testing.T) {
+	c := mustNewCompiler(t)
+
+	p, err := c.Compile(t.Context(), source.NewAnonymous(`VAR str = ""
+
+str += " " + 1 + " " + 2 + " " + 3 + " " + 4 + " " + 5
+
+RETURN str`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p == nil {
+		t.Fatal("program is nil")
+	}
+
+	if len(p.Constants) > 2 {
+		t.Fatalf("expected at most 2 constants, got %d", len(p.Constants))
+	}
+}
+
+func TestCompilerCompileConcurrentSharedCompiler(t *testing.T) {
+	t.Parallel()
+
+	compilerInstance := mustNewCompiler(t, compiler.WithOptimizationLevel(compiler.Full))
+	workers := maxInt(8, runtime.GOMAXPROCS(0)*2)
+	iterations := 80
+
+	validQueries := []string{
+		"RETURN 1",
+		"LET payload = { value: 42, tags: [1, 2, 3] }\nRETURN payload.value",
+		"FOR item IN [1, 2, 3, 4] RETURN item * 2",
+		"LET data = [{ name: 'a' }, { name: 'b' }]\nFOR row IN data RETURN row.name",
+	}
+
+	t.Run("shared_sources", func(t *testing.T) {
+		sources := make([]source.Source, 0, len(validQueries))
+		for i, query := range validQueries {
+			sources = append(sources, source.New(fmt.Sprintf("shared_%d", i), query))
+		}
+
+		runConcurrentCompileWorkers(t, workers, iterations, func(worker, iter int) error {
+			source := sources[(worker+iter)%len(sources)]
+
+			program, err := compilerInstance.Compile(t.Context(), source)
+			if err != nil {
+				return fmt.Errorf("compile failed: %w", err)
+			}
+
+			return assertCompiledProgram(program, source)
+		})
+	})
+
+	t.Run("fresh_sources", func(t *testing.T) {
+		runConcurrentCompileWorkers(t, workers, iterations, func(worker, iter int) error {
+			query := validQueries[(worker+iter)%len(validQueries)]
+			src := source.New(fmt.Sprintf("fresh_%d_%d", worker, iter), query)
+
+			program, err := compilerInstance.Compile(t.Context(), src)
+			if err != nil {
+				return fmt.Errorf("compile failed: %w", err)
+			}
+
+			return assertCompiledProgram(program, src)
+		})
+	})
+
+	udfQueries := []struct {
+		name         string
+		query        string
+		expectedHost []bytecode.HostFunction
+		expectedUDFs int
+	}{
+		{
+			name: "udf_alias_function_name",
+			query: `
+USE FOO::TEST_FN AS FN
+FUNC WRAP(v) => FN(v)
+RETURN WRAP(1)
+`,
+			expectedHost: []bytecode.HostFunction{{Name: "FOO::TEST_FN", ArgCount: 1}},
+			expectedUDFs: 1,
+		},
+		{
+			name: "udf_namespace_alias",
+			query: `
+USE BAR AS B
+FUNC RUN(v) => B::OTHER_FN(v, v + 1)
+RETURN RUN(2)
+`,
+			expectedHost: []bytecode.HostFunction{{Name: "BAR::OTHER_FN", ArgCount: 2}},
+			expectedUDFs: 1,
+		},
+		{
+			name: "udf_host_case_insensitive_identity",
+			query: `
+FUNC wrap() => Foo(1) + foo(2)
+RETURN wrap()
+`,
+			expectedHost: []bytecode.HostFunction{{Name: "Foo", ArgCount: 1}},
+			expectedUDFs: 1,
+		},
+	}
+
+	t.Run("udf_isolation_shared_sources", func(t *testing.T) {
+		type sharedSourceCase struct {
+			spec struct {
+				expectedHost []bytecode.HostFunction
+				expectedUDFs int
+			}
+			source source.Source
+		}
+
+		sources := make([]sharedSourceCase, 0, len(udfQueries))
+
+		for i, query := range udfQueries {
+			item := sharedSourceCase{
+				source: source.New(fmt.Sprintf("udf_shared_%d", i), query.query),
+			}
+
+			item.spec.expectedHost = query.expectedHost
+			item.spec.expectedUDFs = query.expectedUDFs
+			sources = append(sources, item)
+		}
+
+		runConcurrentCompileWorkers(t, workers, iterations, func(worker, iter int) error {
+			entry := sources[(worker+iter)%len(sources)]
+
+			program, err := compilerInstance.Compile(t.Context(), entry.source)
+			if err != nil {
+				return fmt.Errorf("compile failed: %w", err)
+			}
+
+			if err := assertCompiledProgram(program, entry.source); err != nil {
+				return err
+			}
+
+			return assertUDFMetadata(program, entry.spec.expectedHost, entry.spec.expectedUDFs)
+		})
+	})
+
+	t.Run("udf_isolation_fresh_sources", func(t *testing.T) {
+		runConcurrentCompileWorkers(t, workers, iterations, func(worker, iter int) error {
+			query := udfQueries[(worker+iter)%len(udfQueries)]
+			source := source.New(fmt.Sprintf("udf_fresh_%d_%d", worker, iter), query.query)
+
+			program, err := compilerInstance.Compile(t.Context(), source)
+			if err != nil {
+				return fmt.Errorf("compile failed: %w", err)
+			}
+
+			if err := assertCompiledProgram(program, source); err != nil {
+				return err
+			}
+
+			return assertUDFMetadata(program, query.expectedHost, query.expectedUDFs)
+		})
+	})
+}
+
+func TestCompilerCompileConcurrentInvalidQueries(t *testing.T) {
+	t.Parallel()
+
+	compilerInstance := mustNewCompiler(t, compiler.WithOptimizationLevel(compiler.Full))
+	workers := maxInt(8, runtime.GOMAXPROCS(0)*2)
+	iterations := 80
+
+	invalidQueries := []string{
+		"",
+		"RETURN",
+		"LET x =\nRETURN x",
+		"FOR i IN RETURN i",
+	}
+
+	t.Run("invalid_sources", func(t *testing.T) {
+		runConcurrentCompileWorkers(t, workers, iterations, func(worker, iter int) error {
+			query := invalidQueries[(worker+iter)%len(invalidQueries)]
+			source := source.New(fmt.Sprintf("invalid_%d_%d", worker, iter), query)
+
+			program, err := compilerInstance.Compile(t.Context(), source)
+			if err == nil {
+				return fmt.Errorf("expected compilation error")
+			}
+
+			if program != nil {
+				return fmt.Errorf("expected nil program for invalid query")
+			}
+
+			message := strings.ToLower(err.Error())
+			if strings.Contains(message, "unhandled panic") || strings.Contains(message, "goroutine ") {
+				return fmt.Errorf("invalid query returned panic-like error: %s", err.Error())
+			}
+
+			return nil
+		})
+	})
+}
+
+func runConcurrentCompileWorkers(t *testing.T, workers, iterations int, fn func(worker, iter int) error) {
+	t.Helper()
+
+	errs := make(chan error, workers*iterations)
+
+	var wg sync.WaitGroup
+
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+
+		go func(workerID int) {
+			defer wg.Done()
+
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					errs <- fmt.Errorf("worker %d panicked: %v", workerID, recovered)
+				}
+			}()
+
+			for iter := 0; iter < iterations; iter++ {
+				if err := fn(workerID, iter); err != nil {
+					errs <- fmt.Errorf("worker %d iteration %d: %w", workerID, iter, err)
+				}
+			}
+		}(worker)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+
+	return b
+}
+
+func assertCompiledProgram(program *bytecode.Program, src source.Source) error {
+	if program == nil {
+		return fmt.Errorf("program is nil")
+	}
+
+	if program.Source.ID() != src.ID() {
+		return fmt.Errorf("unexpected source identity in output program")
+	}
+
+	if len(program.Bytecode) == 0 {
+		return fmt.Errorf("compiled program has no bytecode")
+	}
+
+	return nil
+}
+
+func assertUDFMetadata(program *bytecode.Program, expectedHost []bytecode.HostFunction, expectedUDFs int) error {
+	host := program.Functions.Host
+	if !slices.Equal(host, expectedHost) {
+		return fmt.Errorf("unexpected host metadata: got %v, expected %v", host, expectedHost)
+	}
+
+	if got := len(program.Functions.UserDefined); got != expectedUDFs {
+		return fmt.Errorf("unexpected udf count: got %d, expected %d", got, expectedUDFs)
+	}
+
+	return nil
+}

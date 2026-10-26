@@ -1,0 +1,130 @@
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"strings"
+)
+
+type String string
+
+const (
+	EmptyString = String("")
+	SpaceString = String(" ")
+)
+
+func NewString(input string) String {
+	if input == "" {
+		return EmptyString
+	}
+
+	return String(input)
+}
+
+func NewStringOf(input any) String {
+	switch v := input.(type) {
+	case string:
+		return String(v)
+	case fmt.Stringer:
+		return String(v.String())
+	default:
+		return String(fmt.Sprintf("%v", input))
+	}
+}
+
+func NewStringFromRunes(input []rune) String {
+	if len(input) == 0 {
+		return EmptyString
+	}
+
+	return String(input)
+}
+
+func ParseString(input any) (String, error) {
+	if IsNil(input) {
+		return EmptyString, nil
+	}
+
+	str, ok := input.(string)
+
+	if ok {
+		if str != "" {
+			return String(str), nil
+		}
+
+		return EmptyString, nil
+	}
+
+	stringer, ok := input.(fmt.Stringer)
+
+	if ok {
+		return String(stringer.String()), nil
+	}
+
+	return EmptyString, Error(ErrInvalidType, fmt.Sprintf("expected %q", TypeString))
+}
+
+func MustParseString(input any) String {
+	res, err := ParseString(input)
+
+	if err != nil {
+		panic(err)
+	}
+
+	return res
+}
+
+func ToString(input Value) String {
+	switch val := input.(type) {
+	case String:
+		return val
+	default:
+		return NewString(val.String())
+	}
+}
+
+func (s String) Type() Type {
+	return TypeString
+}
+
+func (s String) String() string {
+	return string(s)
+}
+
+func (s String) Hash() uint64 {
+	h := fnv.New64a()
+
+	h.Write([]byte(TypeString.Name()))
+	h.Write([]byte(s))
+
+	return h.Sum64()
+}
+
+func (s String) Copy() Value {
+	return s
+}
+
+func (s String) Length(_ context.Context) (Int, error) {
+	return Int(len([]rune(s))), nil
+}
+
+func (s String) Contains(other String) Boolean {
+	return s.IndexOf(other) > -1
+}
+
+func (s String) IndexOf(other String) Int {
+	return Int(strings.Index(string(s), string(other)))
+}
+
+func (s String) Concat(other Value) String {
+	return String(string(s) + other.String())
+}
+
+func (s String) At(index Int) String {
+	return String([]rune(s)[index])
+}
+
+func (s String) Unwrap() any {
+	return string(s)
+}

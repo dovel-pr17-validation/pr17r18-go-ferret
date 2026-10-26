@@ -1,0 +1,33 @@
+package path
+
+import (
+	"context"
+	"path"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// match reports whether name matches the pattern.
+// @param pattern {String} The pattern.
+// @param name {String} The name.
+// @return {Boolean} True if the name matches the pattern.
+func Match(_ context.Context, arg1, arg2 runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgType(arg1, 0, runtime.TypeString); err != nil {
+		return runtime.False, err
+	}
+
+	if err := runtime.ValidateArgType(arg2, 1, runtime.TypeString); err != nil {
+		return runtime.False, err
+	}
+
+	pattern := arg1.String()
+	name := arg2.String()
+
+	matched, err := path.Match(pattern, name)
+
+	if err != nil {
+		return runtime.False, runtime.Error(err, "match")
+	}
+
+	return runtime.NewBoolean(matched), nil
+}

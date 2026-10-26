@@ -1,0 +1,1113 @@
+// Code generated from antlr/FqlParser.g4 by ANTLR 4.13.2. DO NOT EDIT.
+
+package fql // FqlParser
+import "github.com/antlr4-go/antlr/v4"
+
+// FqlParserListener is a complete listener for a parse tree produced by FqlParser.
+type FqlParserListener interface {
+	antlr.ParseTreeListener
+
+	// EnterProgram is called when entering the program production.
+	EnterProgram(c *ProgramContext)
+
+	// EnterHead is called when entering the head production.
+	EnterHead(c *HeadContext)
+
+	// EnterUseExpression is called when entering the useExpression production.
+	EnterUseExpression(c *UseExpressionContext)
+
+	// EnterUse is called when entering the use production.
+	EnterUse(c *UseContext)
+
+	// EnterBody is called when entering the body production.
+	EnterBody(c *BodyContext)
+
+	// EnterBodyStatement is called when entering the bodyStatement production.
+	EnterBodyStatement(c *BodyStatementContext)
+
+	// EnterBodyExpression is called when entering the bodyExpression production.
+	EnterBodyExpression(c *BodyExpressionContext)
+
+	// EnterVariableDeclaration is called when entering the variableDeclaration production.
+	EnterVariableDeclaration(c *VariableDeclarationContext)
+
+	// EnterAssignmentStatement is called when entering the assignmentStatement production.
+	EnterAssignmentStatement(c *AssignmentStatementContext)
+
+	// EnterDeleteStatement is called when entering the deleteStatement production.
+	EnterDeleteStatement(c *DeleteStatementContext)
+
+	// EnterAssignmentTarget is called when entering the assignmentTarget production.
+	EnterAssignmentTarget(c *AssignmentTargetContext)
+
+	// EnterAssignmentTargetPath is called when entering the assignmentTargetPath production.
+	EnterAssignmentTargetPath(c *AssignmentTargetPathContext)
+
+	// EnterAssignmentOperator is called when entering the assignmentOperator production.
+	EnterAssignmentOperator(c *AssignmentOperatorContext)
+
+	// EnterFunctionDeclaration is called when entering the functionDeclaration production.
+	EnterFunctionDeclaration(c *FunctionDeclarationContext)
+
+	// EnterFunctionParameterList is called when entering the functionParameterList production.
+	EnterFunctionParameterList(c *FunctionParameterListContext)
+
+	// EnterFunctionParameter is called when entering the functionParameter production.
+	EnterFunctionParameter(c *FunctionParameterContext)
+
+	// EnterFunctionBody is called when entering the functionBody production.
+	EnterFunctionBody(c *FunctionBodyContext)
+
+	// EnterFunctionArrow is called when entering the functionArrow production.
+	EnterFunctionArrow(c *FunctionArrowContext)
+
+	// EnterFunctionBlock is called when entering the functionBlock production.
+	EnterFunctionBlock(c *FunctionBlockContext)
+
+	// EnterFunctionStatement is called when entering the functionStatement production.
+	EnterFunctionStatement(c *FunctionStatementContext)
+
+	// EnterExpressionStatement is called when entering the expressionStatement production.
+	EnterExpressionStatement(c *ExpressionStatementContext)
+
+	// EnterFunctionReturn is called when entering the functionReturn production.
+	EnterFunctionReturn(c *FunctionReturnContext)
+
+	// EnterReturnExpression is called when entering the returnExpression production.
+	EnterReturnExpression(c *ReturnExpressionContext)
+
+	// EnterReturnValue is called when entering the returnValue production.
+	EnterReturnValue(c *ReturnValueContext)
+
+	// EnterForExpression is called when entering the forExpression production.
+	EnterForExpression(c *ForExpressionContext)
+
+	// EnterForExpressionSource is called when entering the forExpressionSource production.
+	EnterForExpressionSource(c *ForExpressionSourceContext)
+
+	// EnterForExpressionClause is called when entering the forExpressionClause production.
+	EnterForExpressionClause(c *ForExpressionClauseContext)
+
+	// EnterForExpressionStatement is called when entering the forExpressionStatement production.
+	EnterForExpressionStatement(c *ForExpressionStatementContext)
+
+	// EnterForExpressionBody is called when entering the forExpressionBody production.
+	EnterForExpressionBody(c *ForExpressionBodyContext)
+
+	// EnterForExpressionReturn is called when entering the forExpressionReturn production.
+	EnterForExpressionReturn(c *ForExpressionReturnContext)
+
+	// EnterFilterClause is called when entering the filterClause production.
+	EnterFilterClause(c *FilterClauseContext)
+
+	// EnterEventFilterClause is called when entering the eventFilterClause production.
+	EnterEventFilterClause(c *EventFilterClauseContext)
+
+	// EnterWaitForPredicateWhenClause is called when entering the waitForPredicateWhenClause production.
+	EnterWaitForPredicateWhenClause(c *WaitForPredicateWhenClauseContext)
+
+	// EnterLimitClause is called when entering the limitClause production.
+	EnterLimitClause(c *LimitClauseContext)
+
+	// EnterLimitClauseValue is called when entering the limitClauseValue production.
+	EnterLimitClauseValue(c *LimitClauseValueContext)
+
+	// EnterSortClause is called when entering the sortClause production.
+	EnterSortClause(c *SortClauseContext)
+
+	// EnterSortClauseExpression is called when entering the sortClauseExpression production.
+	EnterSortClauseExpression(c *SortClauseExpressionContext)
+
+	// EnterCollectClause is called when entering the collectClause production.
+	EnterCollectClause(c *CollectClauseContext)
+
+	// EnterBindingIdentifier is called when entering the bindingIdentifier production.
+	EnterBindingIdentifier(c *BindingIdentifierContext)
+
+	// EnterLoopVariable is called when entering the loopVariable production.
+	EnterLoopVariable(c *LoopVariableContext)
+
+	// EnterCollectSelector is called when entering the collectSelector production.
+	EnterCollectSelector(c *CollectSelectorContext)
+
+	// EnterCollectGrouping is called when entering the collectGrouping production.
+	EnterCollectGrouping(c *CollectGroupingContext)
+
+	// EnterCollectAggregateSelector is called when entering the collectAggregateSelector production.
+	EnterCollectAggregateSelector(c *CollectAggregateSelectorContext)
+
+	// EnterCollectAggregator is called when entering the collectAggregator production.
+	EnterCollectAggregator(c *CollectAggregatorContext)
+
+	// EnterCollectGroupProjection is called when entering the collectGroupProjection production.
+	EnterCollectGroupProjection(c *CollectGroupProjectionContext)
+
+	// EnterCollectGroupProjectionFilter is called when entering the collectGroupProjectionFilter production.
+	EnterCollectGroupProjectionFilter(c *CollectGroupProjectionFilterContext)
+
+	// EnterCollectCounter is called when entering the collectCounter production.
+	EnterCollectCounter(c *CollectCounterContext)
+
+	// EnterWaitForExpression is called when entering the waitForExpression production.
+	EnterWaitForExpression(c *WaitForExpressionContext)
+
+	// EnterDispatchExpression is called when entering the dispatchExpression production.
+	EnterDispatchExpression(c *DispatchExpressionContext)
+
+	// EnterDispatchEventName is called when entering the dispatchEventName production.
+	EnterDispatchEventName(c *DispatchEventNameContext)
+
+	// EnterDispatchTarget is called when entering the dispatchTarget production.
+	EnterDispatchTarget(c *DispatchTargetContext)
+
+	// EnterDispatchWithClause is called when entering the dispatchWithClause production.
+	EnterDispatchWithClause(c *DispatchWithClauseContext)
+
+	// EnterDispatchOptionsClause is called when entering the dispatchOptionsClause production.
+	EnterDispatchOptionsClause(c *DispatchOptionsClauseContext)
+
+	// EnterWaitForEventExpression is called when entering the waitForEventExpression production.
+	EnterWaitForEventExpression(c *WaitForEventExpressionContext)
+
+	// EnterWaitForEventGroupExpression is called when entering the waitForEventGroupExpression production.
+	EnterWaitForEventGroupExpression(c *WaitForEventGroupExpressionContext)
+
+	// EnterWaitForEventGroupEntry is called when entering the waitForEventGroupEntry production.
+	EnterWaitForEventGroupEntry(c *WaitForEventGroupEntryContext)
+
+	// EnterWaitForEventTail is called when entering the waitForEventTail production.
+	EnterWaitForEventTail(c *WaitForEventTailContext)
+
+	// EnterWaitForTriggerClause is called when entering the waitForTriggerClause production.
+	EnterWaitForTriggerClause(c *WaitForTriggerClauseContext)
+
+	// EnterWaitForTriggerStatement is called when entering the waitForTriggerStatement production.
+	EnterWaitForTriggerStatement(c *WaitForTriggerStatementContext)
+
+	// EnterWaitForTriggerInlineStatement is called when entering the waitForTriggerInlineStatement production.
+	EnterWaitForTriggerInlineStatement(c *WaitForTriggerInlineStatementContext)
+
+	// EnterWaitForTriggerInlineDispatchStatement is called when entering the waitForTriggerInlineDispatchStatement production.
+	EnterWaitForTriggerInlineDispatchStatement(c *WaitForTriggerInlineDispatchStatementContext)
+
+	// EnterWaitForPredicateExpression is called when entering the waitForPredicateExpression production.
+	EnterWaitForPredicateExpression(c *WaitForPredicateExpressionContext)
+
+	// EnterWaitForPredicateGroupExpression is called when entering the waitForPredicateGroupExpression production.
+	EnterWaitForPredicateGroupExpression(c *WaitForPredicateGroupExpressionContext)
+
+	// EnterWaitForPredicateGroupMode is called when entering the waitForPredicateGroupMode production.
+	EnterWaitForPredicateGroupMode(c *WaitForPredicateGroupModeContext)
+
+	// EnterWaitForPredicateGroupEntry is called when entering the waitForPredicateGroupEntry production.
+	EnterWaitForPredicateGroupEntry(c *WaitForPredicateGroupEntryContext)
+
+	// EnterWaitForSynchronization is called when entering the waitForSynchronization production.
+	EnterWaitForSynchronization(c *WaitForSynchronizationContext)
+
+	// EnterWaitForPredicate is called when entering the waitForPredicate production.
+	EnterWaitForPredicate(c *WaitForPredicateContext)
+
+	// EnterWaitForEventName is called when entering the waitForEventName production.
+	EnterWaitForEventName(c *WaitForEventNameContext)
+
+	// EnterWaitForEventSource is called when entering the waitForEventSource production.
+	EnterWaitForEventSource(c *WaitForEventSourceContext)
+
+	// EnterOptionsClause is called when entering the optionsClause production.
+	EnterOptionsClause(c *OptionsClauseContext)
+
+	// EnterTimeoutClause is called when entering the timeoutClause production.
+	EnterTimeoutClause(c *TimeoutClauseContext)
+
+	// EnterEveryClause is called when entering the everyClause production.
+	EnterEveryClause(c *EveryClauseContext)
+
+	// EnterEveryClauseValue is called when entering the everyClauseValue production.
+	EnterEveryClauseValue(c *EveryClauseValueContext)
+
+	// EnterBackoffClause is called when entering the backoffClause production.
+	EnterBackoffClause(c *BackoffClauseContext)
+
+	// EnterJitterClause is called when entering the jitterClause production.
+	EnterJitterClause(c *JitterClauseContext)
+
+	// EnterJitterClauseValue is called when entering the jitterClauseValue production.
+	EnterJitterClauseValue(c *JitterClauseValueContext)
+
+	// EnterBackoffStrategy is called when entering the backoffStrategy production.
+	EnterBackoffStrategy(c *BackoffStrategyContext)
+
+	// EnterRecoveryTails is called when entering the recoveryTails production.
+	EnterRecoveryTails(c *RecoveryTailsContext)
+
+	// EnterRecoveryTail is called when entering the recoveryTail production.
+	EnterRecoveryTail(c *RecoveryTailContext)
+
+	// EnterRecoveryCondition is called when entering the recoveryCondition production.
+	EnterRecoveryCondition(c *RecoveryConditionContext)
+
+	// EnterRecoveryAction is called when entering the recoveryAction production.
+	EnterRecoveryAction(c *RecoveryActionContext)
+
+	// EnterRecoveryReturnExpr is called when entering the recoveryReturnExpr production.
+	EnterRecoveryReturnExpr(c *RecoveryReturnExprContext)
+
+	// EnterRecoveryRetryAction is called when entering the recoveryRetryAction production.
+	EnterRecoveryRetryAction(c *RecoveryRetryActionContext)
+
+	// EnterRecoveryRetryCount is called when entering the recoveryRetryCount production.
+	EnterRecoveryRetryCount(c *RecoveryRetryCountContext)
+
+	// EnterRecoveryRetryDelayClause is called when entering the recoveryRetryDelayClause production.
+	EnterRecoveryRetryDelayClause(c *RecoveryRetryDelayClauseContext)
+
+	// EnterRecoveryRetryDelayValue is called when entering the recoveryRetryDelayValue production.
+	EnterRecoveryRetryDelayValue(c *RecoveryRetryDelayValueContext)
+
+	// EnterRecoveryRetryBackoffClause is called when entering the recoveryRetryBackoffClause production.
+	EnterRecoveryRetryBackoffClause(c *RecoveryRetryBackoffClauseContext)
+
+	// EnterRecoveryRetryBackoffKind is called when entering the recoveryRetryBackoffKind production.
+	EnterRecoveryRetryBackoffKind(c *RecoveryRetryBackoffKindContext)
+
+	// EnterRecoveryRetryOrClause is called when entering the recoveryRetryOrClause production.
+	EnterRecoveryRetryOrClause(c *RecoveryRetryOrClauseContext)
+
+	// EnterRecoveryRetryFinalAction is called when entering the recoveryRetryFinalAction production.
+	EnterRecoveryRetryFinalAction(c *RecoveryRetryFinalActionContext)
+
+	// EnterRecoveryActionOrClause is called when entering the recoveryActionOrClause production.
+	EnterRecoveryActionOrClause(c *RecoveryActionOrClauseContext)
+
+	// EnterOnKeyword is called when entering the onKeyword production.
+	EnterOnKeyword(c *OnKeywordContext)
+
+	// EnterErrorKeyword is called when entering the errorKeyword production.
+	EnterErrorKeyword(c *ErrorKeywordContext)
+
+	// EnterTimeoutKeyword is called when entering the timeoutKeyword production.
+	EnterTimeoutKeyword(c *TimeoutKeywordContext)
+
+	// EnterFailKeyword is called when entering the failKeyword production.
+	EnterFailKeyword(c *FailKeywordContext)
+
+	// EnterRetryKeyword is called when entering the retryKeyword production.
+	EnterRetryKeyword(c *RetryKeywordContext)
+
+	// EnterDelayKeyword is called when entering the delayKeyword production.
+	EnterDelayKeyword(c *DelayKeywordContext)
+
+	// EnterReturnKeyword is called when entering the returnKeyword production.
+	EnterReturnKeyword(c *ReturnKeywordContext)
+
+	// EnterParam is called when entering the param production.
+	EnterParam(c *ParamContext)
+
+	// EnterVariable is called when entering the variable production.
+	EnterVariable(c *VariableContext)
+
+	// EnterLiteral is called when entering the literal production.
+	EnterLiteral(c *LiteralContext)
+
+	// EnterArrayLiteral is called when entering the arrayLiteral production.
+	EnterArrayLiteral(c *ArrayLiteralContext)
+
+	// EnterObjectLiteral is called when entering the objectLiteral production.
+	EnterObjectLiteral(c *ObjectLiteralContext)
+
+	// EnterArrayEntry is called when entering the arrayEntry production.
+	EnterArrayEntry(c *ArrayEntryContext)
+
+	// EnterObjectEntry is called when entering the objectEntry production.
+	EnterObjectEntry(c *ObjectEntryContext)
+
+	// EnterSpreadEntry is called when entering the spreadEntry production.
+	EnterSpreadEntry(c *SpreadEntryContext)
+
+	// EnterBooleanLiteral is called when entering the booleanLiteral production.
+	EnterBooleanLiteral(c *BooleanLiteralContext)
+
+	// EnterStringLiteral is called when entering the stringLiteral production.
+	EnterStringLiteral(c *StringLiteralContext)
+
+	// EnterTemplateLiteral is called when entering the templateLiteral production.
+	EnterTemplateLiteral(c *TemplateLiteralContext)
+
+	// EnterTemplateElement is called when entering the templateElement production.
+	EnterTemplateElement(c *TemplateElementContext)
+
+	// EnterFloatLiteral is called when entering the floatLiteral production.
+	EnterFloatLiteral(c *FloatLiteralContext)
+
+	// EnterIntegerLiteral is called when entering the integerLiteral production.
+	EnterIntegerLiteral(c *IntegerLiteralContext)
+
+	// EnterNoneLiteral is called when entering the noneLiteral production.
+	EnterNoneLiteral(c *NoneLiteralContext)
+
+	// EnterPropertyAssignment is called when entering the propertyAssignment production.
+	EnterPropertyAssignment(c *PropertyAssignmentContext)
+
+	// EnterComputedPropertyName is called when entering the computedPropertyName production.
+	EnterComputedPropertyName(c *ComputedPropertyNameContext)
+
+	// EnterPropertyName is called when entering the propertyName production.
+	EnterPropertyName(c *PropertyNameContext)
+
+	// EnterNamespaceIdentifier is called when entering the namespaceIdentifier production.
+	EnterNamespaceIdentifier(c *NamespaceIdentifierContext)
+
+	// EnterNamespace is called when entering the namespace production.
+	EnterNamespace(c *NamespaceContext)
+
+	// EnterMemberExpression is called when entering the memberExpression production.
+	EnterMemberExpression(c *MemberExpressionContext)
+
+	// EnterMemberExpressionSource is called when entering the memberExpressionSource production.
+	EnterMemberExpressionSource(c *MemberExpressionSourceContext)
+
+	// EnterFunctionCallExpression is called when entering the functionCallExpression production.
+	EnterFunctionCallExpression(c *FunctionCallExpressionContext)
+
+	// EnterFunctionCallNoRecoveryExpression is called when entering the functionCallNoRecoveryExpression production.
+	EnterFunctionCallNoRecoveryExpression(c *FunctionCallNoRecoveryExpressionContext)
+
+	// EnterFunctionCall is called when entering the functionCall production.
+	EnterFunctionCall(c *FunctionCallContext)
+
+	// EnterFunctionName is called when entering the functionName production.
+	EnterFunctionName(c *FunctionNameContext)
+
+	// EnterArgumentList is called when entering the argumentList production.
+	EnterArgumentList(c *ArgumentListContext)
+
+	// EnterMemberExpressionPath is called when entering the memberExpressionPath production.
+	EnterMemberExpressionPath(c *MemberExpressionPathContext)
+
+	// EnterArrayExpansion is called when entering the arrayExpansion production.
+	EnterArrayExpansion(c *ArrayExpansionContext)
+
+	// EnterArrayContraction is called when entering the arrayContraction production.
+	EnterArrayContraction(c *ArrayContractionContext)
+
+	// EnterArrayQuestionMark is called when entering the arrayQuestionMark production.
+	EnterArrayQuestionMark(c *ArrayQuestionMarkContext)
+
+	// EnterArrayQuestionQuantifier is called when entering the arrayQuestionQuantifier production.
+	EnterArrayQuestionQuantifier(c *ArrayQuestionQuantifierContext)
+
+	// EnterArrayQuestionQuantifierValue is called when entering the arrayQuestionQuantifierValue production.
+	EnterArrayQuestionQuantifierValue(c *ArrayQuestionQuantifierValueContext)
+
+	// EnterArrayApply is called when entering the arrayApply production.
+	EnterArrayApply(c *ArrayApplyContext)
+
+	// EnterInlineExpression is called when entering the inlineExpression production.
+	EnterInlineExpression(c *InlineExpressionContext)
+
+	// EnterInlineFilter is called when entering the inlineFilter production.
+	EnterInlineFilter(c *InlineFilterContext)
+
+	// EnterInlineLimit is called when entering the inlineLimit production.
+	EnterInlineLimit(c *InlineLimitContext)
+
+	// EnterInlineReturn is called when entering the inlineReturn production.
+	EnterInlineReturn(c *InlineReturnContext)
+
+	// EnterSafeReservedWord is called when entering the safeReservedWord production.
+	EnterSafeReservedWord(c *SafeReservedWordContext)
+
+	// EnterUnsafeReservedWord is called when entering the unsafeReservedWord production.
+	EnterUnsafeReservedWord(c *UnsafeReservedWordContext)
+
+	// EnterDurationLiteral is called when entering the durationLiteral production.
+	EnterDurationLiteral(c *DurationLiteralContext)
+
+	// EnterRangeOperator is called when entering the rangeOperator production.
+	EnterRangeOperator(c *RangeOperatorContext)
+
+	// EnterRangeOperand is called when entering the rangeOperand production.
+	EnterRangeOperand(c *RangeOperandContext)
+
+	// EnterExpression is called when entering the expression production.
+	EnterExpression(c *ExpressionContext)
+
+	// EnterPredicate is called when entering the predicate production.
+	EnterPredicate(c *PredicateContext)
+
+	// EnterExpressionAtom is called when entering the expressionAtom production.
+	EnterExpressionAtom(c *ExpressionAtomContext)
+
+	// EnterMatchExpression is called when entering the matchExpression production.
+	EnterMatchExpression(c *MatchExpressionContext)
+
+	// EnterMatchPatternArms is called when entering the matchPatternArms production.
+	EnterMatchPatternArms(c *MatchPatternArmsContext)
+
+	// EnterMatchPatternArmList is called when entering the matchPatternArmList production.
+	EnterMatchPatternArmList(c *MatchPatternArmListContext)
+
+	// EnterMatchGuardArms is called when entering the matchGuardArms production.
+	EnterMatchGuardArms(c *MatchGuardArmsContext)
+
+	// EnterMatchGuardArmList is called when entering the matchGuardArmList production.
+	EnterMatchGuardArmList(c *MatchGuardArmListContext)
+
+	// EnterMatchPatternArm is called when entering the matchPatternArm production.
+	EnterMatchPatternArm(c *MatchPatternArmContext)
+
+	// EnterMatchPatternGuard is called when entering the matchPatternGuard production.
+	EnterMatchPatternGuard(c *MatchPatternGuardContext)
+
+	// EnterMatchGuardArm is called when entering the matchGuardArm production.
+	EnterMatchGuardArm(c *MatchGuardArmContext)
+
+	// EnterMatchDefaultArm is called when entering the matchDefaultArm production.
+	EnterMatchDefaultArm(c *MatchDefaultArmContext)
+
+	// EnterMatchPattern is called when entering the matchPattern production.
+	EnterMatchPattern(c *MatchPatternContext)
+
+	// EnterMatchBindingPattern is called when entering the matchBindingPattern production.
+	EnterMatchBindingPattern(c *MatchBindingPatternContext)
+
+	// EnterMatchLiteralPattern is called when entering the matchLiteralPattern production.
+	EnterMatchLiteralPattern(c *MatchLiteralPatternContext)
+
+	// EnterMatchObjectPattern is called when entering the matchObjectPattern production.
+	EnterMatchObjectPattern(c *MatchObjectPatternContext)
+
+	// EnterMatchObjectPatternProperty is called when entering the matchObjectPatternProperty production.
+	EnterMatchObjectPatternProperty(c *MatchObjectPatternPropertyContext)
+
+	// EnterMatchObjectPatternKey is called when entering the matchObjectPatternKey production.
+	EnterMatchObjectPatternKey(c *MatchObjectPatternKeyContext)
+
+	// EnterImplicitMemberExpression is called when entering the implicitMemberExpression production.
+	EnterImplicitMemberExpression(c *ImplicitMemberExpressionContext)
+
+	// EnterImplicitCurrentExpression is called when entering the implicitCurrentExpression production.
+	EnterImplicitCurrentExpression(c *ImplicitCurrentExpressionContext)
+
+	// EnterImplicitMemberExpressionStart is called when entering the implicitMemberExpressionStart production.
+	EnterImplicitMemberExpressionStart(c *ImplicitMemberExpressionStartContext)
+
+	// EnterQueryExpression is called when entering the queryExpression production.
+	EnterQueryExpression(c *QueryExpressionContext)
+
+	// EnterQueryModifier is called when entering the queryModifier production.
+	EnterQueryModifier(c *QueryModifierContext)
+
+	// EnterQueryPayload is called when entering the queryPayload production.
+	EnterQueryPayload(c *QueryPayloadContext)
+
+	// EnterQueryWithOpt is called when entering the queryWithOpt production.
+	EnterQueryWithOpt(c *QueryWithOptContext)
+
+	// EnterQueryOptionsOpt is called when entering the queryOptionsOpt production.
+	EnterQueryOptionsOpt(c *QueryOptionsOptContext)
+
+	// EnterQueryLiteral is called when entering the queryLiteral production.
+	EnterQueryLiteral(c *QueryLiteralContext)
+
+	// EnterArrayOperator is called when entering the arrayOperator production.
+	EnterArrayOperator(c *ArrayOperatorContext)
+
+	// EnterEqualityOperator is called when entering the equalityOperator production.
+	EnterEqualityOperator(c *EqualityOperatorContext)
+
+	// EnterInOperator is called when entering the inOperator production.
+	EnterInOperator(c *InOperatorContext)
+
+	// EnterLikeOperator is called when entering the likeOperator production.
+	EnterLikeOperator(c *LikeOperatorContext)
+
+	// EnterUnaryOperator is called when entering the unaryOperator production.
+	EnterUnaryOperator(c *UnaryOperatorContext)
+
+	// EnterRegexpOperator is called when entering the regexpOperator production.
+	EnterRegexpOperator(c *RegexpOperatorContext)
+
+	// EnterLogicalAndOperator is called when entering the logicalAndOperator production.
+	EnterLogicalAndOperator(c *LogicalAndOperatorContext)
+
+	// EnterLogicalOrOperator is called when entering the logicalOrOperator production.
+	EnterLogicalOrOperator(c *LogicalOrOperatorContext)
+
+	// EnterMultiplicativeOperator is called when entering the multiplicativeOperator production.
+	EnterMultiplicativeOperator(c *MultiplicativeOperatorContext)
+
+	// EnterAdditiveOperator is called when entering the additiveOperator production.
+	EnterAdditiveOperator(c *AdditiveOperatorContext)
+
+	// EnterErrorOperator is called when entering the errorOperator production.
+	EnterErrorOperator(c *ErrorOperatorContext)
+
+	// EnterBindingPattern is called when entering the bindingPattern production.
+	EnterBindingPattern(c *BindingPatternContext)
+
+	// EnterStructuredBindingPattern is called when entering the structuredBindingPattern production.
+	EnterStructuredBindingPattern(c *StructuredBindingPatternContext)
+
+	// EnterObjectBindingPattern is called when entering the objectBindingPattern production.
+	EnterObjectBindingPattern(c *ObjectBindingPatternContext)
+
+	// EnterObjectBindingEntry is called when entering the objectBindingEntry production.
+	EnterObjectBindingEntry(c *ObjectBindingEntryContext)
+
+	// EnterArrayBindingPattern is called when entering the arrayBindingPattern production.
+	EnterArrayBindingPattern(c *ArrayBindingPatternContext)
+
+	// ExitProgram is called when exiting the program production.
+	ExitProgram(c *ProgramContext)
+
+	// ExitHead is called when exiting the head production.
+	ExitHead(c *HeadContext)
+
+	// ExitUseExpression is called when exiting the useExpression production.
+	ExitUseExpression(c *UseExpressionContext)
+
+	// ExitUse is called when exiting the use production.
+	ExitUse(c *UseContext)
+
+	// ExitBody is called when exiting the body production.
+	ExitBody(c *BodyContext)
+
+	// ExitBodyStatement is called when exiting the bodyStatement production.
+	ExitBodyStatement(c *BodyStatementContext)
+
+	// ExitBodyExpression is called when exiting the bodyExpression production.
+	ExitBodyExpression(c *BodyExpressionContext)
+
+	// ExitVariableDeclaration is called when exiting the variableDeclaration production.
+	ExitVariableDeclaration(c *VariableDeclarationContext)
+
+	// ExitAssignmentStatement is called when exiting the assignmentStatement production.
+	ExitAssignmentStatement(c *AssignmentStatementContext)
+
+	// ExitDeleteStatement is called when exiting the deleteStatement production.
+	ExitDeleteStatement(c *DeleteStatementContext)
+
+	// ExitAssignmentTarget is called when exiting the assignmentTarget production.
+	ExitAssignmentTarget(c *AssignmentTargetContext)
+
+	// ExitAssignmentTargetPath is called when exiting the assignmentTargetPath production.
+	ExitAssignmentTargetPath(c *AssignmentTargetPathContext)
+
+	// ExitAssignmentOperator is called when exiting the assignmentOperator production.
+	ExitAssignmentOperator(c *AssignmentOperatorContext)
+
+	// ExitFunctionDeclaration is called when exiting the functionDeclaration production.
+	ExitFunctionDeclaration(c *FunctionDeclarationContext)
+
+	// ExitFunctionParameterList is called when exiting the functionParameterList production.
+	ExitFunctionParameterList(c *FunctionParameterListContext)
+
+	// ExitFunctionParameter is called when exiting the functionParameter production.
+	ExitFunctionParameter(c *FunctionParameterContext)
+
+	// ExitFunctionBody is called when exiting the functionBody production.
+	ExitFunctionBody(c *FunctionBodyContext)
+
+	// ExitFunctionArrow is called when exiting the functionArrow production.
+	ExitFunctionArrow(c *FunctionArrowContext)
+
+	// ExitFunctionBlock is called when exiting the functionBlock production.
+	ExitFunctionBlock(c *FunctionBlockContext)
+
+	// ExitFunctionStatement is called when exiting the functionStatement production.
+	ExitFunctionStatement(c *FunctionStatementContext)
+
+	// ExitExpressionStatement is called when exiting the expressionStatement production.
+	ExitExpressionStatement(c *ExpressionStatementContext)
+
+	// ExitFunctionReturn is called when exiting the functionReturn production.
+	ExitFunctionReturn(c *FunctionReturnContext)
+
+	// ExitReturnExpression is called when exiting the returnExpression production.
+	ExitReturnExpression(c *ReturnExpressionContext)
+
+	// ExitReturnValue is called when exiting the returnValue production.
+	ExitReturnValue(c *ReturnValueContext)
+
+	// ExitForExpression is called when exiting the forExpression production.
+	ExitForExpression(c *ForExpressionContext)
+
+	// ExitForExpressionSource is called when exiting the forExpressionSource production.
+	ExitForExpressionSource(c *ForExpressionSourceContext)
+
+	// ExitForExpressionClause is called when exiting the forExpressionClause production.
+	ExitForExpressionClause(c *ForExpressionClauseContext)
+
+	// ExitForExpressionStatement is called when exiting the forExpressionStatement production.
+	ExitForExpressionStatement(c *ForExpressionStatementContext)
+
+	// ExitForExpressionBody is called when exiting the forExpressionBody production.
+	ExitForExpressionBody(c *ForExpressionBodyContext)
+
+	// ExitForExpressionReturn is called when exiting the forExpressionReturn production.
+	ExitForExpressionReturn(c *ForExpressionReturnContext)
+
+	// ExitFilterClause is called when exiting the filterClause production.
+	ExitFilterClause(c *FilterClauseContext)
+
+	// ExitEventFilterClause is called when exiting the eventFilterClause production.
+	ExitEventFilterClause(c *EventFilterClauseContext)
+
+	// ExitWaitForPredicateWhenClause is called when exiting the waitForPredicateWhenClause production.
+	ExitWaitForPredicateWhenClause(c *WaitForPredicateWhenClauseContext)
+
+	// ExitLimitClause is called when exiting the limitClause production.
+	ExitLimitClause(c *LimitClauseContext)
+
+	// ExitLimitClauseValue is called when exiting the limitClauseValue production.
+	ExitLimitClauseValue(c *LimitClauseValueContext)
+
+	// ExitSortClause is called when exiting the sortClause production.
+	ExitSortClause(c *SortClauseContext)
+
+	// ExitSortClauseExpression is called when exiting the sortClauseExpression production.
+	ExitSortClauseExpression(c *SortClauseExpressionContext)
+
+	// ExitCollectClause is called when exiting the collectClause production.
+	ExitCollectClause(c *CollectClauseContext)
+
+	// ExitBindingIdentifier is called when exiting the bindingIdentifier production.
+	ExitBindingIdentifier(c *BindingIdentifierContext)
+
+	// ExitLoopVariable is called when exiting the loopVariable production.
+	ExitLoopVariable(c *LoopVariableContext)
+
+	// ExitCollectSelector is called when exiting the collectSelector production.
+	ExitCollectSelector(c *CollectSelectorContext)
+
+	// ExitCollectGrouping is called when exiting the collectGrouping production.
+	ExitCollectGrouping(c *CollectGroupingContext)
+
+	// ExitCollectAggregateSelector is called when exiting the collectAggregateSelector production.
+	ExitCollectAggregateSelector(c *CollectAggregateSelectorContext)
+
+	// ExitCollectAggregator is called when exiting the collectAggregator production.
+	ExitCollectAggregator(c *CollectAggregatorContext)
+
+	// ExitCollectGroupProjection is called when exiting the collectGroupProjection production.
+	ExitCollectGroupProjection(c *CollectGroupProjectionContext)
+
+	// ExitCollectGroupProjectionFilter is called when exiting the collectGroupProjectionFilter production.
+	ExitCollectGroupProjectionFilter(c *CollectGroupProjectionFilterContext)
+
+	// ExitCollectCounter is called when exiting the collectCounter production.
+	ExitCollectCounter(c *CollectCounterContext)
+
+	// ExitWaitForExpression is called when exiting the waitForExpression production.
+	ExitWaitForExpression(c *WaitForExpressionContext)
+
+	// ExitDispatchExpression is called when exiting the dispatchExpression production.
+	ExitDispatchExpression(c *DispatchExpressionContext)
+
+	// ExitDispatchEventName is called when exiting the dispatchEventName production.
+	ExitDispatchEventName(c *DispatchEventNameContext)
+
+	// ExitDispatchTarget is called when exiting the dispatchTarget production.
+	ExitDispatchTarget(c *DispatchTargetContext)
+
+	// ExitDispatchWithClause is called when exiting the dispatchWithClause production.
+	ExitDispatchWithClause(c *DispatchWithClauseContext)
+
+	// ExitDispatchOptionsClause is called when exiting the dispatchOptionsClause production.
+	ExitDispatchOptionsClause(c *DispatchOptionsClauseContext)
+
+	// ExitWaitForEventExpression is called when exiting the waitForEventExpression production.
+	ExitWaitForEventExpression(c *WaitForEventExpressionContext)
+
+	// ExitWaitForEventGroupExpression is called when exiting the waitForEventGroupExpression production.
+	ExitWaitForEventGroupExpression(c *WaitForEventGroupExpressionContext)
+
+	// ExitWaitForEventGroupEntry is called when exiting the waitForEventGroupEntry production.
+	ExitWaitForEventGroupEntry(c *WaitForEventGroupEntryContext)
+
+	// ExitWaitForEventTail is called when exiting the waitForEventTail production.
+	ExitWaitForEventTail(c *WaitForEventTailContext)
+
+	// ExitWaitForTriggerClause is called when exiting the waitForTriggerClause production.
+	ExitWaitForTriggerClause(c *WaitForTriggerClauseContext)
+
+	// ExitWaitForTriggerStatement is called when exiting the waitForTriggerStatement production.
+	ExitWaitForTriggerStatement(c *WaitForTriggerStatementContext)
+
+	// ExitWaitForTriggerInlineStatement is called when exiting the waitForTriggerInlineStatement production.
+	ExitWaitForTriggerInlineStatement(c *WaitForTriggerInlineStatementContext)
+
+	// ExitWaitForTriggerInlineDispatchStatement is called when exiting the waitForTriggerInlineDispatchStatement production.
+	ExitWaitForTriggerInlineDispatchStatement(c *WaitForTriggerInlineDispatchStatementContext)
+
+	// ExitWaitForPredicateExpression is called when exiting the waitForPredicateExpression production.
+	ExitWaitForPredicateExpression(c *WaitForPredicateExpressionContext)
+
+	// ExitWaitForPredicateGroupExpression is called when exiting the waitForPredicateGroupExpression production.
+	ExitWaitForPredicateGroupExpression(c *WaitForPredicateGroupExpressionContext)
+
+	// ExitWaitForPredicateGroupMode is called when exiting the waitForPredicateGroupMode production.
+	ExitWaitForPredicateGroupMode(c *WaitForPredicateGroupModeContext)
+
+	// ExitWaitForPredicateGroupEntry is called when exiting the waitForPredicateGroupEntry production.
+	ExitWaitForPredicateGroupEntry(c *WaitForPredicateGroupEntryContext)
+
+	// ExitWaitForSynchronization is called when exiting the waitForSynchronization production.
+	ExitWaitForSynchronization(c *WaitForSynchronizationContext)
+
+	// ExitWaitForPredicate is called when exiting the waitForPredicate production.
+	ExitWaitForPredicate(c *WaitForPredicateContext)
+
+	// ExitWaitForEventName is called when exiting the waitForEventName production.
+	ExitWaitForEventName(c *WaitForEventNameContext)
+
+	// ExitWaitForEventSource is called when exiting the waitForEventSource production.
+	ExitWaitForEventSource(c *WaitForEventSourceContext)
+
+	// ExitOptionsClause is called when exiting the optionsClause production.
+	ExitOptionsClause(c *OptionsClauseContext)
+
+	// ExitTimeoutClause is called when exiting the timeoutClause production.
+	ExitTimeoutClause(c *TimeoutClauseContext)
+
+	// ExitEveryClause is called when exiting the everyClause production.
+	ExitEveryClause(c *EveryClauseContext)
+
+	// ExitEveryClauseValue is called when exiting the everyClauseValue production.
+	ExitEveryClauseValue(c *EveryClauseValueContext)
+
+	// ExitBackoffClause is called when exiting the backoffClause production.
+	ExitBackoffClause(c *BackoffClauseContext)
+
+	// ExitJitterClause is called when exiting the jitterClause production.
+	ExitJitterClause(c *JitterClauseContext)
+
+	// ExitJitterClauseValue is called when exiting the jitterClauseValue production.
+	ExitJitterClauseValue(c *JitterClauseValueContext)
+
+	// ExitBackoffStrategy is called when exiting the backoffStrategy production.
+	ExitBackoffStrategy(c *BackoffStrategyContext)
+
+	// ExitRecoveryTails is called when exiting the recoveryTails production.
+	ExitRecoveryTails(c *RecoveryTailsContext)
+
+	// ExitRecoveryTail is called when exiting the recoveryTail production.
+	ExitRecoveryTail(c *RecoveryTailContext)
+
+	// ExitRecoveryCondition is called when exiting the recoveryCondition production.
+	ExitRecoveryCondition(c *RecoveryConditionContext)
+
+	// ExitRecoveryAction is called when exiting the recoveryAction production.
+	ExitRecoveryAction(c *RecoveryActionContext)
+
+	// ExitRecoveryReturnExpr is called when exiting the recoveryReturnExpr production.
+	ExitRecoveryReturnExpr(c *RecoveryReturnExprContext)
+
+	// ExitRecoveryRetryAction is called when exiting the recoveryRetryAction production.
+	ExitRecoveryRetryAction(c *RecoveryRetryActionContext)
+
+	// ExitRecoveryRetryCount is called when exiting the recoveryRetryCount production.
+	ExitRecoveryRetryCount(c *RecoveryRetryCountContext)
+
+	// ExitRecoveryRetryDelayClause is called when exiting the recoveryRetryDelayClause production.
+	ExitRecoveryRetryDelayClause(c *RecoveryRetryDelayClauseContext)
+
+	// ExitRecoveryRetryDelayValue is called when exiting the recoveryRetryDelayValue production.
+	ExitRecoveryRetryDelayValue(c *RecoveryRetryDelayValueContext)
+
+	// ExitRecoveryRetryBackoffClause is called when exiting the recoveryRetryBackoffClause production.
+	ExitRecoveryRetryBackoffClause(c *RecoveryRetryBackoffClauseContext)
+
+	// ExitRecoveryRetryBackoffKind is called when exiting the recoveryRetryBackoffKind production.
+	ExitRecoveryRetryBackoffKind(c *RecoveryRetryBackoffKindContext)
+
+	// ExitRecoveryRetryOrClause is called when exiting the recoveryRetryOrClause production.
+	ExitRecoveryRetryOrClause(c *RecoveryRetryOrClauseContext)
+
+	// ExitRecoveryRetryFinalAction is called when exiting the recoveryRetryFinalAction production.
+	ExitRecoveryRetryFinalAction(c *RecoveryRetryFinalActionContext)
+
+	// ExitRecoveryActionOrClause is called when exiting the recoveryActionOrClause production.
+	ExitRecoveryActionOrClause(c *RecoveryActionOrClauseContext)
+
+	// ExitOnKeyword is called when exiting the onKeyword production.
+	ExitOnKeyword(c *OnKeywordContext)
+
+	// ExitErrorKeyword is called when exiting the errorKeyword production.
+	ExitErrorKeyword(c *ErrorKeywordContext)
+
+	// ExitTimeoutKeyword is called when exiting the timeoutKeyword production.
+	ExitTimeoutKeyword(c *TimeoutKeywordContext)
+
+	// ExitFailKeyword is called when exiting the failKeyword production.
+	ExitFailKeyword(c *FailKeywordContext)
+
+	// ExitRetryKeyword is called when exiting the retryKeyword production.
+	ExitRetryKeyword(c *RetryKeywordContext)
+
+	// ExitDelayKeyword is called when exiting the delayKeyword production.
+	ExitDelayKeyword(c *DelayKeywordContext)
+
+	// ExitReturnKeyword is called when exiting the returnKeyword production.
+	ExitReturnKeyword(c *ReturnKeywordContext)
+
+	// ExitParam is called when exiting the param production.
+	ExitParam(c *ParamContext)
+
+	// ExitVariable is called when exiting the variable production.
+	ExitVariable(c *VariableContext)
+
+	// ExitLiteral is called when exiting the literal production.
+	ExitLiteral(c *LiteralContext)
+
+	// ExitArrayLiteral is called when exiting the arrayLiteral production.
+	ExitArrayLiteral(c *ArrayLiteralContext)
+
+	// ExitObjectLiteral is called when exiting the objectLiteral production.
+	ExitObjectLiteral(c *ObjectLiteralContext)
+
+	// ExitArrayEntry is called when exiting the arrayEntry production.
+	ExitArrayEntry(c *ArrayEntryContext)
+
+	// ExitObjectEntry is called when exiting the objectEntry production.
+	ExitObjectEntry(c *ObjectEntryContext)
+
+	// ExitSpreadEntry is called when exiting the spreadEntry production.
+	ExitSpreadEntry(c *SpreadEntryContext)
+
+	// ExitBooleanLiteral is called when exiting the booleanLiteral production.
+	ExitBooleanLiteral(c *BooleanLiteralContext)
+
+	// ExitStringLiteral is called when exiting the stringLiteral production.
+	ExitStringLiteral(c *StringLiteralContext)
+
+	// ExitTemplateLiteral is called when exiting the templateLiteral production.
+	ExitTemplateLiteral(c *TemplateLiteralContext)
+
+	// ExitTemplateElement is called when exiting the templateElement production.
+	ExitTemplateElement(c *TemplateElementContext)
+
+	// ExitFloatLiteral is called when exiting the floatLiteral production.
+	ExitFloatLiteral(c *FloatLiteralContext)
+
+	// ExitIntegerLiteral is called when exiting the integerLiteral production.
+	ExitIntegerLiteral(c *IntegerLiteralContext)
+
+	// ExitNoneLiteral is called when exiting the noneLiteral production.
+	ExitNoneLiteral(c *NoneLiteralContext)
+
+	// ExitPropertyAssignment is called when exiting the propertyAssignment production.
+	ExitPropertyAssignment(c *PropertyAssignmentContext)
+
+	// ExitComputedPropertyName is called when exiting the computedPropertyName production.
+	ExitComputedPropertyName(c *ComputedPropertyNameContext)
+
+	// ExitPropertyName is called when exiting the propertyName production.
+	ExitPropertyName(c *PropertyNameContext)
+
+	// ExitNamespaceIdentifier is called when exiting the namespaceIdentifier production.
+	ExitNamespaceIdentifier(c *NamespaceIdentifierContext)
+
+	// ExitNamespace is called when exiting the namespace production.
+	ExitNamespace(c *NamespaceContext)
+
+	// ExitMemberExpression is called when exiting the memberExpression production.
+	ExitMemberExpression(c *MemberExpressionContext)
+
+	// ExitMemberExpressionSource is called when exiting the memberExpressionSource production.
+	ExitMemberExpressionSource(c *MemberExpressionSourceContext)
+
+	// ExitFunctionCallExpression is called when exiting the functionCallExpression production.
+	ExitFunctionCallExpression(c *FunctionCallExpressionContext)
+
+	// ExitFunctionCallNoRecoveryExpression is called when exiting the functionCallNoRecoveryExpression production.
+	ExitFunctionCallNoRecoveryExpression(c *FunctionCallNoRecoveryExpressionContext)
+
+	// ExitFunctionCall is called when exiting the functionCall production.
+	ExitFunctionCall(c *FunctionCallContext)
+
+	// ExitFunctionName is called when exiting the functionName production.
+	ExitFunctionName(c *FunctionNameContext)
+
+	// ExitArgumentList is called when exiting the argumentList production.
+	ExitArgumentList(c *ArgumentListContext)
+
+	// ExitMemberExpressionPath is called when exiting the memberExpressionPath production.
+	ExitMemberExpressionPath(c *MemberExpressionPathContext)
+
+	// ExitArrayExpansion is called when exiting the arrayExpansion production.
+	ExitArrayExpansion(c *ArrayExpansionContext)
+
+	// ExitArrayContraction is called when exiting the arrayContraction production.
+	ExitArrayContraction(c *ArrayContractionContext)
+
+	// ExitArrayQuestionMark is called when exiting the arrayQuestionMark production.
+	ExitArrayQuestionMark(c *ArrayQuestionMarkContext)
+
+	// ExitArrayQuestionQuantifier is called when exiting the arrayQuestionQuantifier production.
+	ExitArrayQuestionQuantifier(c *ArrayQuestionQuantifierContext)
+
+	// ExitArrayQuestionQuantifierValue is called when exiting the arrayQuestionQuantifierValue production.
+	ExitArrayQuestionQuantifierValue(c *ArrayQuestionQuantifierValueContext)
+
+	// ExitArrayApply is called when exiting the arrayApply production.
+	ExitArrayApply(c *ArrayApplyContext)
+
+	// ExitInlineExpression is called when exiting the inlineExpression production.
+	ExitInlineExpression(c *InlineExpressionContext)
+
+	// ExitInlineFilter is called when exiting the inlineFilter production.
+	ExitInlineFilter(c *InlineFilterContext)
+
+	// ExitInlineLimit is called when exiting the inlineLimit production.
+	ExitInlineLimit(c *InlineLimitContext)
+
+	// ExitInlineReturn is called when exiting the inlineReturn production.
+	ExitInlineReturn(c *InlineReturnContext)
+
+	// ExitSafeReservedWord is called when exiting the safeReservedWord production.
+	ExitSafeReservedWord(c *SafeReservedWordContext)
+
+	// ExitUnsafeReservedWord is called when exiting the unsafeReservedWord production.
+	ExitUnsafeReservedWord(c *UnsafeReservedWordContext)
+
+	// ExitDurationLiteral is called when exiting the durationLiteral production.
+	ExitDurationLiteral(c *DurationLiteralContext)
+
+	// ExitRangeOperator is called when exiting the rangeOperator production.
+	ExitRangeOperator(c *RangeOperatorContext)
+
+	// ExitRangeOperand is called when exiting the rangeOperand production.
+	ExitRangeOperand(c *RangeOperandContext)
+
+	// ExitExpression is called when exiting the expression production.
+	ExitExpression(c *ExpressionContext)
+
+	// ExitPredicate is called when exiting the predicate production.
+	ExitPredicate(c *PredicateContext)
+
+	// ExitExpressionAtom is called when exiting the expressionAtom production.
+	ExitExpressionAtom(c *ExpressionAtomContext)
+
+	// ExitMatchExpression is called when exiting the matchExpression production.
+	ExitMatchExpression(c *MatchExpressionContext)
+
+	// ExitMatchPatternArms is called when exiting the matchPatternArms production.
+	ExitMatchPatternArms(c *MatchPatternArmsContext)
+
+	// ExitMatchPatternArmList is called when exiting the matchPatternArmList production.
+	ExitMatchPatternArmList(c *MatchPatternArmListContext)
+
+	// ExitMatchGuardArms is called when exiting the matchGuardArms production.
+	ExitMatchGuardArms(c *MatchGuardArmsContext)
+
+	// ExitMatchGuardArmList is called when exiting the matchGuardArmList production.
+	ExitMatchGuardArmList(c *MatchGuardArmListContext)
+
+	// ExitMatchPatternArm is called when exiting the matchPatternArm production.
+	ExitMatchPatternArm(c *MatchPatternArmContext)
+
+	// ExitMatchPatternGuard is called when exiting the matchPatternGuard production.
+	ExitMatchPatternGuard(c *MatchPatternGuardContext)
+
+	// ExitMatchGuardArm is called when exiting the matchGuardArm production.
+	ExitMatchGuardArm(c *MatchGuardArmContext)
+
+	// ExitMatchDefaultArm is called when exiting the matchDefaultArm production.
+	ExitMatchDefaultArm(c *MatchDefaultArmContext)
+
+	// ExitMatchPattern is called when exiting the matchPattern production.
+	ExitMatchPattern(c *MatchPatternContext)
+
+	// ExitMatchBindingPattern is called when exiting the matchBindingPattern production.
+	ExitMatchBindingPattern(c *MatchBindingPatternContext)
+
+	// ExitMatchLiteralPattern is called when exiting the matchLiteralPattern production.
+	ExitMatchLiteralPattern(c *MatchLiteralPatternContext)
+
+	// ExitMatchObjectPattern is called when exiting the matchObjectPattern production.
+	ExitMatchObjectPattern(c *MatchObjectPatternContext)
+
+	// ExitMatchObjectPatternProperty is called when exiting the matchObjectPatternProperty production.
+	ExitMatchObjectPatternProperty(c *MatchObjectPatternPropertyContext)
+
+	// ExitMatchObjectPatternKey is called when exiting the matchObjectPatternKey production.
+	ExitMatchObjectPatternKey(c *MatchObjectPatternKeyContext)
+
+	// ExitImplicitMemberExpression is called when exiting the implicitMemberExpression production.
+	ExitImplicitMemberExpression(c *ImplicitMemberExpressionContext)
+
+	// ExitImplicitCurrentExpression is called when exiting the implicitCurrentExpression production.
+	ExitImplicitCurrentExpression(c *ImplicitCurrentExpressionContext)
+
+	// ExitImplicitMemberExpressionStart is called when exiting the implicitMemberExpressionStart production.
+	ExitImplicitMemberExpressionStart(c *ImplicitMemberExpressionStartContext)
+
+	// ExitQueryExpression is called when exiting the queryExpression production.
+	ExitQueryExpression(c *QueryExpressionContext)
+
+	// ExitQueryModifier is called when exiting the queryModifier production.
+	ExitQueryModifier(c *QueryModifierContext)
+
+	// ExitQueryPayload is called when exiting the queryPayload production.
+	ExitQueryPayload(c *QueryPayloadContext)
+
+	// ExitQueryWithOpt is called when exiting the queryWithOpt production.
+	ExitQueryWithOpt(c *QueryWithOptContext)
+
+	// ExitQueryOptionsOpt is called when exiting the queryOptionsOpt production.
+	ExitQueryOptionsOpt(c *QueryOptionsOptContext)
+
+	// ExitQueryLiteral is called when exiting the queryLiteral production.
+	ExitQueryLiteral(c *QueryLiteralContext)
+
+	// ExitArrayOperator is called when exiting the arrayOperator production.
+	ExitArrayOperator(c *ArrayOperatorContext)
+
+	// ExitEqualityOperator is called when exiting the equalityOperator production.
+	ExitEqualityOperator(c *EqualityOperatorContext)
+
+	// ExitInOperator is called when exiting the inOperator production.
+	ExitInOperator(c *InOperatorContext)
+
+	// ExitLikeOperator is called when exiting the likeOperator production.
+	ExitLikeOperator(c *LikeOperatorContext)
+
+	// ExitUnaryOperator is called when exiting the unaryOperator production.
+	ExitUnaryOperator(c *UnaryOperatorContext)
+
+	// ExitRegexpOperator is called when exiting the regexpOperator production.
+	ExitRegexpOperator(c *RegexpOperatorContext)
+
+	// ExitLogicalAndOperator is called when exiting the logicalAndOperator production.
+	ExitLogicalAndOperator(c *LogicalAndOperatorContext)
+
+	// ExitLogicalOrOperator is called when exiting the logicalOrOperator production.
+	ExitLogicalOrOperator(c *LogicalOrOperatorContext)
+
+	// ExitMultiplicativeOperator is called when exiting the multiplicativeOperator production.
+	ExitMultiplicativeOperator(c *MultiplicativeOperatorContext)
+
+	// ExitAdditiveOperator is called when exiting the additiveOperator production.
+	ExitAdditiveOperator(c *AdditiveOperatorContext)
+
+	// ExitErrorOperator is called when exiting the errorOperator production.
+	ExitErrorOperator(c *ErrorOperatorContext)
+
+	// ExitBindingPattern is called when exiting the bindingPattern production.
+	ExitBindingPattern(c *BindingPatternContext)
+
+	// ExitStructuredBindingPattern is called when exiting the structuredBindingPattern production.
+	ExitStructuredBindingPattern(c *StructuredBindingPatternContext)
+
+	// ExitObjectBindingPattern is called when exiting the objectBindingPattern production.
+	ExitObjectBindingPattern(c *ObjectBindingPatternContext)
+
+	// ExitObjectBindingEntry is called when exiting the objectBindingEntry production.
+	ExitObjectBindingEntry(c *ObjectBindingEntryContext)
+
+	// ExitArrayBindingPattern is called when exiting the arrayBindingPattern production.
+	ExitArrayBindingPattern(c *ArrayBindingPatternContext)
+}

@@ -1,0 +1,178 @@
+package internal
+
+import (
+	"github.com/antlr4-go/antlr/v4"
+
+	"github.com/MontFerret/ferret/v2/pkg/source"
+
+	"github.com/MontFerret/ferret/v2/pkg/parser/diagnostics"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+
+	"github.com/MontFerret/ferret/v2/pkg/compiler/internal/core"
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type DispatchCompiler struct {
+	ctx      *CompilationSession
+	exprs    *ExprCompiler
+	literals *LiteralCompiler
+	recovery *RecoveryCompiler
+	facts    *TypeFacts
+}
+
+func NewDispatchCompiler(ctx *CompilationSession) *DispatchCompiler {
+	return &DispatchCompiler{
+		ctx: ctx,
+	}
+}
+
+func (c *DispatchCompiler) bind(exprs *ExprCompiler, literals *LiteralCompiler, recovery *RecoveryCompiler, facts *TypeFacts) {
+	if c == nil {
+		return
+	}
+
+	c.exprs = exprs
+	c.literals = literals
+	c.recovery = recovery
+	c.facts = facts
+}
+
+func (c *DispatchCompiler) Compile(ctx fql.IDispatchExpressionContext) bytecode.Operand {
+	if ctx == nil {
+		return bytecode.NoopOperand
+	}
+
+	return c.recovery.CompileOperation(OperationRecoverySpec{
+		Owner:    ctx,
+		JumpMode: core.CatchJumpModeNone,
+		CompilePlain: func() bytecode.Operand {
+			return c.compileCore(
+				ctx.DispatchTarget(),
+				ctx.DispatchEventName(),
+				ctx.DispatchWithClause(),
+				ctx.DispatchOptionsClause(),
+				c.dispatchSpan(ctx),
+			)
+		},
+	})
+}
+
+func (c *DispatchCompiler) compileCore(
+	target fql.IDispatchTargetContext,
+	event fql.IDispatchEventNameContext,
+	with fql.IDispatchWithClauseContext,
+	options fql.IDispatchOptionsClauseContext,
+	span source.Span,
+) bytecode.Operand {
+	targetReg := ensureDispatchOperandRegister(c.ctx, c.facts, c.compileTarget(target))
+	eventReg := ensureDispatchOperandRegister(c.ctx, c.facts, c.compileEventName(event))
+	payloadReg := ensureDispatchOperandRegister(c.ctx, c.facts, c.compilePayload(with))
+	optionsReg := ensureDispatchOperandRegister(c.ctx, c.facts, c.compileOptions(options))
+	argsReg := c.buildDispatchArgs(payloadReg, optionsReg)
+
+	dst := c.ctx.Function.Registers.Allocate()
+
+	c.ctx.Program.Emitter.WithSpan(span, func() {
+		c.ctx.Program.Emitter.EmitMove(dst, targetReg)
+		c.ctx.Program.Emitter.EmitABC(bytecode.OpDispatch, dst, eventReg, argsReg)
+	})
+
+	c.ctx.Function.Types.Set(dst, core.TypeNone)
+
+	return dst
+}
+
+func (c *DispatchCompiler) compileEventName(ctx fql.IDispatchEventNameContext) bytecode.Operand {
+	if ctx == nil {
+		return bytecode.NoopOperand
+	}
+
+	if sl := ctx.StringLiteral(); sl != nil {
+		return c.literals.CompileStringLiteral(sl)
+	}
+
+	if v := ctx.Variable(); v != nil {
+		return c.exprs.CompileVariable(v)
+	}
+
+	if p := ctx.Param(); p != nil {
+		return c.exprs.CompileParam(p)
+	}
+
+	if me := ctx.MemberExpression(); me != nil {
+		return c.exprs.CompileMemberExpression(me)
+	}
+
+	if fc := ctx.FunctionCall(); fc != nil {
+		return c.exprs.CompileFunctionCall(fc, false)
+	}
+
+	return bytecode.NoopOperand
+}
+
+func (c *DispatchCompiler) compileTarget(ctx fql.IDispatchTargetContext) bytecode.Operand {
+	if ctx == nil {
+		return bytecode.NoopOperand
+	}
+
+	if v := ctx.Variable(); v != nil {
+		return c.exprs.CompileVariable(v)
+	}
+
+	if p := ctx.Param(); p != nil {
+		return c.exprs.CompileParam(p)
+	}
+
+	if me := ctx.MemberExpression(); me != nil {
+		return c.exprs.CompileMemberExpression(me)
+	}
+
+	if fc := ctx.FunctionCallExpression(); fc != nil {
+		return c.exprs.CompileFunctionCallExpression(fc)
+	}
+
+	if expr := ctx.Expression(); expr != nil {
+		return c.exprs.Compile(expr)
+	}
+
+	return bytecode.NoopOperand
+}
+
+func (c *DispatchCompiler) compilePayload(ctx fql.IDispatchWithClauseContext) bytecode.Operand {
+	if ctx == nil || ctx.Expression() == nil {
+		return c.facts.LoadConstant(runtime.None)
+	}
+
+	return c.exprs.Compile(ctx.Expression())
+}
+
+func (c *DispatchCompiler) compileOptions(ctx fql.IDispatchOptionsClauseContext) bytecode.Operand {
+	if ctx == nil || ctx.Expression() == nil {
+		return c.facts.LoadConstant(runtime.None)
+	}
+
+	return c.exprs.Compile(ctx.Expression())
+}
+
+func (c *DispatchCompiler) buildDispatchArgs(payload, options bytecode.Operand) bytecode.Operand {
+	dst := c.ctx.Function.Registers.Allocate()
+	payloadKey := c.ctx.Function.Symbols.AddConstant(runtime.NewString("payload"))
+	optionsKey := c.ctx.Function.Symbols.AddConstant(runtime.NewString("options"))
+
+	c.ctx.Program.Emitter.EmitObject(dst, 2)
+	c.ctx.Program.Emitter.EmitObjectSetConst(dst, payloadKey, payload)
+	c.ctx.Program.Emitter.EmitObjectSetConst(dst, optionsKey, options)
+	c.ctx.Function.Types.Set(dst, core.TypeObject)
+
+	return dst
+}
+
+func (c *DispatchCompiler) dispatchSpan(ctx antlr.ParserRuleContext) source.Span {
+	if ctx == nil {
+		return source.Span{Start: -1, End: -1}
+	}
+
+	return diagnostics.SpanFromRuleContext(ctx)
+}

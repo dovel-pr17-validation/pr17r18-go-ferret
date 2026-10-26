@@ -1,0 +1,75 @@
+package path_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+
+	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/path"
+)
+
+func TestBase(t *testing.T) {
+	Convey("Wrong argument", t, func() {
+		var err error
+		_, err = path.Base(context.Background(), runtime.NewInt(0))
+
+		So(err, ShouldBeError)
+	})
+
+	Convey("Base('') should return '.'", t, func() {
+		out, _ := path.Base(
+			context.Background(),
+			runtime.NewString(""),
+		)
+
+		So(out.String(), ShouldEqual, ".")
+	})
+
+	Convey("Base('.') should return '.'", t, func() {
+		out, _ := path.Base(
+			context.Background(),
+			runtime.NewString("."),
+		)
+
+		So(out.String(), ShouldEqual, ".")
+	})
+
+	Convey("Base('pkg/path/base.go') should return 'base.go'", t, func() {
+		out, _ := path.Base(
+			context.Background(),
+			runtime.NewString("pkg/path/base.go"),
+		)
+
+		So(out.String(), ShouldEqual, "base.go")
+	})
+
+	Convey("Base('/') should return '/'", t, func() {
+		out, _ := path.Base(
+			context.Background(),
+			runtime.NewString("/"),
+		)
+
+		So(out.String(), ShouldEqual, "/")
+	})
+
+	Convey("Base('/usr/bin/') should return 'bin'", t, func() {
+		out, _ := path.Base(
+			context.Background(),
+			runtime.NewString("/usr/bin/"),
+		)
+
+		So(out.String(), ShouldEqual, "bin")
+	})
+
+	Convey("Base('a/b/c') should return 'c'", t, func() {
+		out, _ := path.Base(
+			context.Background(),
+			runtime.NewString("a/b/c"),
+		)
+
+		So(out.String(), ShouldEqual, "c")
+	})
+}

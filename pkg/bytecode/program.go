@@ -1,0 +1,157 @@
+package bytecode
+
+import (
+	"fmt"
+
+	"github.com/goccy/go-json"
+
+	"github.com/MontFerret/ferret/v2/pkg/source"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+const Version = 1
+
+type (
+	// Catch stores an inclusive instruction range [start, end] and an optional recovery jump target.
+	Catch [3]int
+
+	// DebugPointID identifies a debug point within one compiled program.
+	DebugPointID int
+
+	// DebugPointKind identifies the source-level role of a debug point.
+	DebugPointKind int
+
+	Metadata struct {
+		Labels                 map[int]string  `json:"labels"`
+		CompilerVersion        string          `json:"compilerVersion"`
+		AggregatePlans         []AggregatePlan `json:"aggregatePlans"`
+		AggregateSelectorSlots []int           `json:"aggregateSelectorSlots,omitempty"`
+		CallArgumentSpans      [][]source.Span `json:"callArgumentSpans,omitempty"`
+		MatchFailTargets       []int           `json:"matchFailTargets,omitempty"`
+		DebugSpans             []source.Span   `json:"debugSpans"`
+		DebugPoints            []DebugPoint    `json:"debugPoints,omitempty"`
+		OptimizationLevel      int             `json:"optimizationLevel"`
+	}
+
+	// DebugBinding records one source-visible binding at a logical debug point.
+	DebugBinding struct {
+		Name     string  `json:"name"`
+		Register Operand `json:"register"`
+		Mutable  bool    `json:"mutable,omitempty"`
+		Cell     bool    `json:"cell,omitempty"`
+	}
+
+	// DebugPoint identifies an executable logical source location and the
+	// bindings visible before it executes.
+	DebugPoint struct {
+		Bindings   []DebugBinding `json:"bindings,omitempty"`
+		Span       source.Span    `json:"span"`
+		ID         DebugPointID   `json:"id"`
+		PC         int            `json:"pc"`
+		FunctionID FunctionID     `json:"functionId"`
+		Kind       DebugPointKind `json:"kind,omitempty"`
+	}
+
+	Program struct {
+		Functions  Functions
+		Bytecode   []Instruction
+		Constants  []runtime.Value
+		CatchTable []Catch
+		Params     []string
+		Metadata   Metadata
+		Source     source.Source
+		ISAVersion int
+		Registers  int
+	}
+)
+
+const (
+	DebugPointStatement DebugPointKind = iota
+	DebugPointReturn
+	DebugPointFunctionEntry
+	DebugPointCallSite
+	DebugPointLoop
+	DebugPointSynthetic
+)
+
+func (p *Program) MarshalJSON() ([]byte, error) {
+	if p == nil {
+		return []byte("null"), nil
+	}
+
+	constants := make([]constantJSON, len(p.Constants))
+
+	for i, value := range p.Constants {
+		encoded, err := encodeConstant(value)
+
+		if err != nil {
+			return nil, fmt.Errorf("bytecode.Program: encode constant %d: %w", i, err)
+		}
+
+		constants[i] = encoded
+	}
+
+	var src *source.Source
+	if !p.Source.Empty() {
+		src = &p.Source
+	}
+
+	payload := programJSON{
+		ISAVersion: p.ISAVersion,
+		Source:     src,
+		Registers:  p.Registers,
+		Bytecode:   p.Bytecode,
+		Constants:  constants,
+		CatchTable: p.CatchTable,
+		Params:     p.Params,
+		Functions:  p.Functions,
+		Metadata:   p.Metadata,
+	}
+
+	return json.Marshal(payload)
+}
+
+func (p *Program) UnmarshalJSON(data []byte) error {
+	if p == nil {
+		return fmt.Errorf("bytecode.Program: UnmarshalJSON on nil pointer")
+	}
+
+	var decoded programJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	constants := make([]runtime.Value, len(decoded.Constants))
+
+	for i, value := range decoded.Constants {
+		decodedValue, err := decodeConstant(value)
+
+		if err != nil {
+			return fmt.Errorf("bytecode.Program: decode constant %d: %w", i, err)
+		}
+
+		constants[i] = decodedValue
+	}
+
+	if err := validateHostFunctions(decoded.Functions.Host); err != nil {
+		return err
+	}
+
+	var src source.Source
+	if decoded.Source != nil {
+		src = *decoded.Source
+	}
+
+	p.Source = src
+	p.ISAVersion = decoded.ISAVersion
+	p.Registers = decoded.Registers
+	p.Bytecode = decoded.Bytecode
+	p.Constants = constants
+	p.CatchTable = decoded.CatchTable
+	p.Params = decoded.Params
+	p.Functions = decoded.Functions
+	p.Metadata = decoded.Metadata
+
+	return nil
+}

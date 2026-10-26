@@ -1,0 +1,42 @@
+package compiler_test
+
+import (
+	"testing"
+
+	parserd "github.com/MontFerret/ferret/v2/pkg/parser/diagnostics"
+	"github.com/MontFerret/ferret/v2/test/spec"
+	. "github.com/MontFerret/ferret/v2/test/spec/compile"
+)
+
+func TestErrors(t *testing.T) {
+	RunSpecs(t, []spec.Spec{
+		Failure(
+			`
+			LET i = NONE
+			LET i = 1
+			RETURN i
+		`, E{
+				Kind:    parserd.NameError,
+				Message: "Variable 'i' is already defined",
+			}, "Global variable not unique"),
+		Failure(
+			`
+			RETURN i
+		`, E{
+				Kind:    parserd.NameError,
+				Message: "Variable 'i' is not defined",
+			}, "Global variable not defined"),
+		Failure(
+			`
+			LET items = (
+			  FOR i IN [1]
+			    LET x = 1
+			    RETURN i
+			)
+			RETURN x
+		`, E{
+				Kind:    parserd.NameError,
+				Message: "Variable 'x' is not defined",
+			}, "Inner-scope constant LET does not leak after scope exit"),
+	})
+}

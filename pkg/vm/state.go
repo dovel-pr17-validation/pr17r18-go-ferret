@@ -1,0 +1,928 @@
+package vm
+
+import (
+	"errors"
+	"io"
+	"time"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/vm/internal/diagnostics"
+	"github.com/MontFerret/ferret/v2/pkg/vm/internal/frame"
+	"github.com/MontFerret/ferret/v2/pkg/vm/internal/mem"
+)
+
+type (
+	pendingFailure struct {
+		err         error
+		fallback    runtime.Value
+		pc          int
+		originPC    int
+		dst         bytecode.Operand
+		kind        errorKind
+		mode        recoveryMode
+		setFallback bool
+	}
+
+	execState struct {
+		program     *bytecode.Program
+		env         *Environment
+		startedAt   time.Time
+		scratch     mem.Scratch
+		frames      frame.CallStack
+		windows     mem.WindowPool
+		catchByPC   []int
+		registers   mem.RegisterFile
+		cells       mem.CellStore
+		cellHandles []mem.CellHandle
+		owned       mem.OwnedResources
+		aliases     mem.AliasTracker
+		deferred    mem.DeferredClosers
+		failure     pendingFailure
+		caught      pendingFailure
+		pc          int
+		lastPC      int
+		hasFail     bool
+		hasCaught   bool
+	}
+)
+
+func (s *execState) init(program *bytecode.Program) {
+	s.program = program
+	s.catchByPC = buildCatchByPC(len(program.Bytecode), program.CatchTable)
+	s.registers = mem.NewRegisterFile(program.Registers)
+	s.scratch = mem.NewScratch(len(program.Params))
+	s.frames = frame.NewCallStack()
+	s.windows = mem.NewWindowPool(maxUDFRegisters(program.Functions.UserDefined))
+}
+
+func (s *execState) startRun(env *Environment) error {
+	s.env = env
+	s.startedAt = time.Now()
+	s.cells.Reset()
+	s.cellHandles = s.cellHandles[:0]
+	s.owned.Reset()
+	s.aliases.Reset()
+	s.deferred.Reset()
+	s.pc = 0
+	s.lastPC = -1
+	s.clearFailure()
+	s.clearCaughtFailure()
+
+	return s.bindParams(env)
+}
+
+func (s *execState) endRun() {
+	_ = s.endRunWithError()
+}
+
+func (s *execState) endRunWithError() error {
+	for {
+		s.cleanupCurrentCells()
+		s.owned.DrainTo(&s.deferred)
+
+		caller, ok := s.frames.Pop()
+		if !ok {
+			break
+		}
+
+		s.windows.Release(s.registers)
+		s.registers = caller.CallerRegisters
+		s.cellHandles = caller.CellHandles
+		s.owned = caller.OwnedResources
+		s.aliases = caller.Aliases
+	}
+
+	err := s.deferred.CloseAll()
+	s.resetRunStorage()
+
+	return err
+}
+
+func (s *execState) finishRun(root runtime.Value) *Result {
+	return s.finishRunInto(root, newResult(root))
+}
+
+func (s *execState) finishRunInto(root runtime.Value, result *Result) *Result {
+	result.reset(root)
+
+	s.cleanupCurrentCells()
+
+	if s.owned.Empty() && s.deferred.Empty() {
+		s.resetRunStorage()
+		return result
+	}
+
+	var resultOwned mem.OwnedResources
+
+	if key, closer, ok := mem.ResourceKeyOf(root); ok && s.owned.ExtractByKey(key) {
+		resultOwned.TrackResolved(key, closer)
+	}
+
+	if !s.owned.Empty() {
+		s.owned.DrainTo(&s.deferred)
+	}
+
+	if !resultOwned.Empty() {
+		result.adoptOwned(&resultOwned)
+	}
+
+	if !s.deferred.Empty() {
+		result.adoptDeferred(&s.deferred)
+	}
+
+	s.resetRunStorage()
+
+	return result
+}
+
+func (s *execState) resetRunStorage() {
+	s.cells.Reset()
+	s.cellHandles = s.cellHandles[:0]
+
+	s.owned.Reset()
+	s.aliases.Reset()
+	s.deferred.Reset()
+	s.registers.Reset()
+	s.scratch.Reset()
+
+	s.env = nil
+	s.startedAt = time.Time{}
+	s.pc = 0
+	s.lastPC = -1
+	s.clearFailure()
+	s.clearCaughtFailure()
+}
+
+// elapsed returns time since the current run began using Go's monotonic clock.
+func (s *execState) elapsed() runtime.Duration {
+	return runtime.NewDuration(time.Since(s.startedAt))
+}
+
+func (s *execState) bindParams(env *Environment) error {
+	required := s.program.Params
+	if len(required) == 0 {
+		return nil
+	}
+
+	s.scratch.ResizeParams(len(required))
+
+	for idx, name := range required {
+		val, exists := env.Params[name]
+
+		if !exists {
+			val = runtime.None
+		}
+
+		val = normalizeValue(val)
+		s.scratch.Params[idx] = val
+	}
+
+	return nil
+}
+
+func (s *execState) raiseRuntimeAt(pc int, err error, mode recoveryMode, dst bytecode.Operand, fallback runtime.Value, setFallback bool) {
+	s.raise(pc, err, errKindRuntime, mode, dst, fallback, setFallback)
+}
+
+func (s *execState) raiseRuntime(err error, mode recoveryMode, dst bytecode.Operand, fallback runtime.Value, setFallback bool) {
+	s.raiseRuntimeAt(s.pc, err, mode, dst, fallback, setFallback)
+}
+
+func (s *execState) raiseInvariantAt(pc int, err error) {
+	s.raise(pc, err, errKindInvariant, recoverDefault, bytecode.NoopOperand, nil, false)
+}
+
+func (s *execState) raiseInvariant(err error) {
+	s.raiseInvariantAt(s.pc, err)
+}
+
+func (s *execState) raise(pc int, err error, kind errorKind, mode recoveryMode, dst bytecode.Operand, fallback runtime.Value, setFallback bool) {
+	if err == nil || s.hasFail {
+		return
+	}
+
+	s.lastPC = pc
+	s.failure = pendingFailure{
+		err:         err,
+		kind:        kind,
+		mode:        mode,
+		pc:          pc,
+		originPC:    pc,
+		dst:         dst,
+		fallback:    fallback,
+		setFallback: setFallback,
+	}
+	s.hasFail = true
+}
+
+func (s *execState) rethrowRuntimeAt(pc int) {
+	if !s.hasCaught {
+		err := runtime.Error(runtime.ErrInvalidOperation, "RETHROW requires a caught runtime failure")
+		s.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+		return
+	}
+
+	caught := s.caught
+	originPC := caught.originPC
+	if originPC < 0 {
+		originPC = caught.pc
+	}
+
+	s.raise(pc, caught.err, caught.kind, recoverDefault, bytecode.NoopOperand, nil, false)
+
+	if s.hasFail {
+		s.failure.originPC = originPC
+	}
+}
+
+func (s *execState) hasFailure() bool {
+	return s.hasFail
+}
+
+func (s *execState) failureError() error {
+	if !s.hasFail {
+		return nil
+	}
+
+	return s.failure.err
+}
+
+func (s *execState) clearFailure() {
+	if !s.hasFail {
+		return
+	}
+
+	s.failure = pendingFailure{}
+	s.hasFail = false
+}
+
+func (s *execState) rememberCaughtFailure(failure pendingFailure) {
+	s.caught = failure
+	s.hasCaught = true
+}
+
+func (s *execState) clearCaughtFailure() {
+	if !s.hasCaught {
+		return
+	}
+
+	s.caught = pendingFailure{}
+	s.hasCaught = false
+}
+
+func (s *execState) resolveFailure() errAction {
+	if !s.hasFail {
+		return errOK
+	}
+
+	failure := s.failure
+
+	switch failure.kind {
+	case errKindInvariant:
+		return errReturn
+	case errKindRuntime:
+		switch failure.mode {
+		case recoverOptional:
+			if s.isOptionalMiss(failure.err) {
+				s.applyFailureFallback(failure)
+				s.clearFailure()
+
+				return errContinue
+			}
+
+			return s.resolveRuntimeDefault(failure)
+		case recoverMissingMember:
+			if s.isMissingMember(failure.err) {
+				s.applyFailureFallback(failure)
+				s.clearFailure()
+
+				return errContinue
+			}
+
+			return s.resolveRuntimeDefault(failure)
+		case recoverProtected:
+			s.applyFailureFallback(failure)
+			s.clearFailure()
+
+			return errContinue
+		default:
+			return s.resolveRuntimeDefault(failure)
+		}
+	default:
+		return errReturn
+	}
+}
+
+func (s *execState) resolveRuntimeDefault(failure pendingFailure) errAction {
+	if catch, ok := s.tryCatch(failure.pc); ok {
+		s.rememberCaughtFailure(failure)
+		s.applyFailureFallback(failure)
+
+		if catch[2] >= 0 {
+			s.pc = catch[2]
+		}
+
+		s.clearFailure()
+
+		return errContinue
+	}
+
+	if s.unwindToProtected() {
+		s.clearFailure()
+
+		return errContinue
+	}
+
+	return errReturn
+}
+
+func (s *execState) applyFailureFallback(failure pendingFailure) {
+	if failure.setFallback && failure.dst.IsRegister() {
+		s.writeBorrowedRegister(failure.dst, failure.fallback)
+	}
+}
+
+func (s *execState) isOptionalMiss(err error) bool {
+	return s.isMissingMember(err) || s.isNullMemberDereference(err)
+}
+
+func (s *execState) isMissingMember(err error) bool {
+	return errors.Is(err, runtime.ErrNotFound)
+}
+
+func (s *execState) isNullMemberDereference(err error) bool {
+	var memberErr *diagnostics.MemberAccessError
+
+	if !errors.As(err, &memberErr) {
+		return false
+	}
+
+	return runtime.IsSameType(memberErr.Target, runtime.TypeNone)
+}
+
+func (s *execState) errorPC() int {
+	if s.hasFail {
+		return s.failure.originPC
+	}
+
+	if s.lastPC >= 0 {
+		return s.lastPC
+	}
+
+	if s.pc > 0 {
+		return s.pc - 1
+	}
+
+	return 0
+}
+
+func (s *execState) toRuntimePC(pc int) int {
+	return pc + 1
+}
+
+func (s *execState) wrapRuntimeError(err error) error {
+	return diagnostics.WrapRuntimeError(s.program, s.toRuntimePC(s.errorPC()), s.frames.TraceEntries(), err)
+}
+
+func (s *execState) runtimeErrorFromPanic(r any) error {
+	return diagnostics.RuntimeErrorFromPanic(s.program, s.toRuntimePC(s.errorPC()), s.frames.TraceEntries(), r)
+}
+
+func (s *execState) tryCatch(pos int) (bytecode.Catch, bool) {
+	if s.catchByPC != nil && pos >= 0 && pos < len(s.catchByPC) {
+		if idx := s.catchByPC[pos]; idx >= 0 {
+			return s.program.CatchTable[idx], true
+		}
+
+		return bytecode.Catch{}, false
+	}
+
+	for _, pair := range s.program.CatchTable {
+		if pos >= pair[0] && pos <= pair[1] {
+			return pair, true
+		}
+	}
+
+	return bytecode.Catch{}, false
+}
+
+func (s *execState) setOrRaiseDefault(pc int, dst bytecode.Operand, val runtime.Value, err error) {
+	if err == nil {
+		s.writeBorrowedRegister(dst, val)
+
+		return
+	}
+
+	s.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.None, true)
+}
+
+func (s *execState) setProducedOrRaiseDefault(pc int, dst bytecode.Operand, val runtime.Value, err error) {
+	if err == nil {
+		s.writeProducedRegister(dst, val)
+
+		return
+	}
+
+	s.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.None, true)
+}
+
+func (s *execState) setOrOptional(pc int, dst bytecode.Operand, val runtime.Value, err error, optional bool) {
+	if err == nil {
+		s.writeBorrowedRegister(dst, val)
+
+		return
+	}
+
+	if optional && s.isNullMemberDereference(err) {
+		s.writeBorrowedRegister(dst, runtime.None)
+
+		return
+	}
+
+	mode := recoverMissingMember
+	if optional {
+		mode = recoverOptional
+	}
+
+	s.raiseRuntimeAt(pc, err, mode, dst, runtime.None, true)
+}
+
+func (s *execState) unwindToProtected() bool {
+	boundary := s.frames.NearestRecoveryBoundary()
+	if boundary < 0 {
+		return false
+	}
+
+	for s.frames.Len() > boundary+1 {
+		frame, ok := s.frames.Pop()
+		if !ok {
+			return false
+		}
+
+		s.cleanupCurrentCells()
+		s.owned.DrainTo(&s.deferred)
+		s.windows.Release(s.registers)
+		s.registers = frame.CallerRegisters
+		s.cellHandles = frame.CellHandles
+		s.owned = frame.OwnedResources
+		s.aliases = frame.Aliases
+	}
+
+	frame, ok := s.frames.Pop()
+	if !ok {
+		return false
+	}
+
+	s.cleanupCurrentCells()
+	s.owned.DrainTo(&s.deferred)
+	s.windows.Release(s.registers)
+	s.registers = frame.CallerRegisters
+	s.cellHandles = frame.CellHandles
+	s.owned = frame.OwnedResources
+	s.aliases = frame.Aliases
+
+	if frame.ReturnDest.IsRegister() {
+		s.writeBorrowedRegister(frame.ReturnDest, runtime.None)
+	}
+
+	s.pc = frame.ReturnPC
+
+	return true
+}
+
+func (s *execState) returnToCaller(retVal runtime.Value) bool {
+	frame, ok := s.frames.Pop()
+	if !ok {
+		return false
+	}
+
+	var (
+		retKey    mem.ResourceKey
+		retCloser io.Closer
+		retOwned  bool
+	)
+
+	s.cleanupCurrentCells()
+
+	if !s.owned.Empty() {
+		if key, closer, ok := mem.ResourceKeyOf(retVal); ok {
+			retKey = key
+			retCloser = closer
+			retOwned = s.owned.ExtractByKey(key)
+		}
+
+		s.owned.DrainTo(&s.deferred)
+	}
+
+	s.windows.Release(s.registers)
+	s.registers = frame.CallerRegisters
+	s.cellHandles = frame.CellHandles
+	s.owned = frame.OwnedResources
+	s.aliases = frame.Aliases
+	if frame.ReturnDest.IsRegister() {
+		s.writeBorrowedRegister(frame.ReturnDest, retVal)
+
+		if retOwned {
+			s.owned.TrackResolved(retKey, retCloser)
+			s.aliases.Inc(retKey)
+		}
+	}
+
+	s.pc = frame.ReturnPC
+
+	return true
+}
+
+func (s *execState) setCallResult(pc int, op bytecode.Opcode, dst bytecode.Operand, out runtime.Value, err error) {
+	if err == nil {
+		s.writeProducedRegister(dst, out)
+
+		return
+	}
+
+	if bytecode.IsProtectedCall(op) {
+		s.raiseRuntimeAt(pc, err, recoverProtected, dst, runtime.None, true)
+
+		return
+	}
+
+	s.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.None, true)
+}
+
+// decAliasAndMaybeDiscard decrements the alias count for key and, if no
+// live register aliases remain, discards the resource from owned resources.
+// This replaces the old O(n) register scan with an O(1) map lookup.
+func (s *execState) decAliasAndMaybeDiscard(key mem.ResourceKey, closer io.Closer) {
+	if s.aliases.Dec(key) > 0 {
+		return
+	}
+
+	s.owned.DiscardByKey(key, closer, &s.deferred)
+}
+
+// retireOwnership terminally removes VM ownership of val after the value
+// escapes into an external sink. Any stale register aliases are ignored by
+// later automatic cleanup.
+func (s *execState) retireOwnership(val runtime.Value) {
+	key, _, ok := mem.ResourceKeyOf(val)
+	if !ok {
+		return
+	}
+
+	s.owned.ExtractByKey(key)
+	s.aliases.Delete(key)
+}
+
+func (s *execState) snapshotCellHandles() []mem.CellHandle {
+	if len(s.cellHandles) == 0 {
+		return nil
+	}
+
+	out := make([]mem.CellHandle, len(s.cellHandles))
+	copy(out, s.cellHandles)
+
+	return out
+}
+
+func (s *execState) cleanupCurrentCells() {
+	if len(s.cellHandles) == 0 {
+		return
+	}
+
+	for _, handle := range s.cellHandles {
+		val, ok := s.cells.Delete(handle)
+		if !ok {
+			continue
+		}
+
+		key, closer, ok := mem.ResourceKeyOf(val)
+		if !ok || !s.owned.OwnsKey(key) {
+			continue
+		}
+
+		s.decAliasAndMaybeDiscard(key, closer)
+	}
+
+	s.cellHandles = s.cellHandles[:0]
+}
+
+func (s *execState) valueOf(constants []runtime.Value, op bytecode.Operand) runtime.Value {
+	switch {
+	case op.IsRegister():
+		return normalizeValue(s.registers[op])
+	case op.IsConstant():
+		return normalizeValue(constants[op.Constant()])
+	default:
+		return runtime.None
+	}
+}
+
+func (s *execState) cellHandleOf(op bytecode.Operand) (mem.CellHandle, bool) {
+	if !op.IsRegister() {
+		return mem.CellHandle{}, false
+	}
+
+	handle, ok := s.registers[op].(mem.CellHandle)
+
+	return handle, ok
+}
+
+func (s *execState) aliasOwnedValue(dst bytecode.Operand, val runtime.Value, key mem.ResourceKey) runtime.Value {
+	if !dst.IsRegister() {
+		return val
+	}
+
+	prev := s.registers[dst]
+
+	if !mem.CanTrackValue(prev) {
+		s.registers[dst] = val
+		s.aliases.Inc(key)
+
+		return val
+	}
+
+	prevKey, prevCloser, ok := mem.ResourceKeyOf(prev)
+	if !ok || !s.owned.OwnsKey(prevKey) {
+		s.registers[dst] = val
+		s.aliases.Inc(key)
+
+		return val
+	}
+
+	if prevKey != key {
+		s.decAliasAndMaybeDiscard(prevKey, prevCloser)
+	}
+
+	s.registers[dst] = val
+	s.aliases.Inc(key)
+
+	return val
+}
+
+func (s *execState) makeCell(dst bytecode.Operand, val runtime.Value) runtime.Value {
+	val = normalizeValue(val)
+
+	if key, _, ok := mem.ResourceKeyOf(val); ok && s.owned.OwnsKey(key) {
+		s.aliases.Inc(key)
+	}
+
+	handle := s.cells.New(val)
+	s.cellHandles = append(s.cellHandles, handle)
+
+	return s.writeBorrowedRegister(dst, handle)
+}
+
+func (s *execState) loadCell(dst bytecode.Operand, handle mem.CellHandle) (runtime.Value, error) {
+	val, ok := s.cells.Get(handle)
+	if !ok {
+		return runtime.None, runtime.Error(runtime.ErrInvalidOperation, "invalid cell handle")
+	}
+
+	val = normalizeValue(val)
+	key, _, ok := mem.ResourceKeyOf(val)
+	if !ok || !s.owned.OwnsKey(key) {
+		return s.writeBorrowedRegister(dst, val), nil
+	}
+
+	return s.aliasOwnedValue(dst, val, key), nil
+}
+
+func (s *execState) storeCell(handle mem.CellHandle, val runtime.Value) error {
+	oldVal, ok := s.cells.Get(handle)
+	if !ok {
+		return runtime.Error(runtime.ErrInvalidOperation, "invalid cell handle")
+	}
+
+	val = normalizeValue(val)
+	oldKey, oldCloser, oldTrackable := mem.ResourceKeyOf(oldVal)
+	oldOwned := oldTrackable && s.owned.OwnsKey(oldKey)
+	newKey, _, newTrackable := mem.ResourceKeyOf(val)
+	newOwned := newTrackable && s.owned.OwnsKey(newKey)
+
+	if oldOwned && (!newOwned || oldKey != newKey) {
+		s.decAliasAndMaybeDiscard(oldKey, oldCloser)
+	}
+
+	if !s.cells.Set(handle, val) {
+		return runtime.Error(runtime.ErrInvalidOperation, "invalid cell handle")
+	}
+
+	if newOwned && (!oldOwned || oldKey != newKey) {
+		s.aliases.Inc(newKey)
+	}
+
+	return nil
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Register Write Discipline
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// These are the ONLY legal ways to mutate register state.
+// Direct reg[i] = v assignments are forbidden outside these helpers.
+//
+// Each helper encodes ownership semantics and ensures correct cleanup:
+//
+//   writeBorrowedRegister(dst, val)   - Write a borrowed/untracked value
+//   writeProducedRegister(dst, val)   - Write a produced/owned value
+//   copyRegister(dst, src)            - Copy register value (ownership follows value)
+//   clearRegister(dst)                - Clear register to None
+//
+// Hot path optimization:
+//   - Most register writes don't involve closers
+//   - Check if old value is owned FIRST (cheap map lookup)
+//   - Only scan for aliases when overwriting an owned closer
+//   - Early return on common non-closer case
+//
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// writeBorrowedRegister writes a borrowed (not owned) value to a register.
+// Use this for values that are:
+//   - constants
+//   - parameters
+//   - computed values that don't need tracking (numbers, strings, bools)
+//   - values from other registers (borrowed references)
+//
+// Fast path: obvious scalar values cannot participate in ownership, so we can
+// overwrite them without probing ownership state.
+func (s *execState) writeBorrowedRegister(dst bytecode.Operand, val runtime.Value) runtime.Value {
+	val = normalizeValue(val)
+
+	if !dst.IsRegister() {
+		return val
+	}
+
+	prev := s.registers[dst]
+
+	if !mem.CanTrackValue(prev) {
+		s.registers[dst] = val
+		return val
+	}
+
+	prevKey, prevCloser, ok := mem.ResourceKeyOf(prev)
+	if !ok || !s.owned.OwnsKey(prevKey) {
+		s.registers[dst] = val
+
+		return val
+	}
+
+	newKey, _, newOK := mem.ResourceKeyOf(val)
+
+	if !newOK || prevKey != newKey {
+		s.decAliasAndMaybeDiscard(prevKey, prevCloser)
+	}
+
+	s.registers[dst] = val
+
+	return val
+}
+
+// writeProducedRegister writes a produced (owned) value to a register.
+// Use this for values that are:
+//   - newly allocated objects (arrays, objects, iterators)
+//   - returned from host functions
+//   - created by VM instructions (streams, collectors, etc.)
+//
+// The value will be tracked for ownership and cleanup when it resolves to a
+// closable resource.
+func (s *execState) writeProducedRegister(dst bytecode.Operand, val runtime.Value) runtime.Value {
+	val = normalizeValue(val)
+	newKey, newCloser, newOK := mem.ResourceKeyOf(val)
+
+	if !dst.IsRegister() {
+		if newOK {
+			s.owned.TrackResolved(newKey, newCloser)
+		}
+
+		return val
+	}
+
+	prev := s.registers[dst]
+
+	if !mem.CanTrackValue(prev) {
+		s.registers[dst] = val
+
+		if newOK {
+			s.owned.TrackResolved(newKey, newCloser)
+			s.aliases.Inc(newKey)
+		}
+
+		return val
+	}
+
+	prevKey, prevCloser, ok := mem.ResourceKeyOf(prev)
+
+	if !ok || !s.owned.OwnsKey(prevKey) {
+		s.registers[dst] = val
+
+		if newOK {
+			s.owned.TrackResolved(newKey, newCloser)
+			s.aliases.Inc(newKey)
+		}
+
+		return val
+	}
+
+	if !newOK || prevKey != newKey {
+		s.decAliasAndMaybeDiscard(prevKey, prevCloser)
+	}
+
+	s.registers[dst] = val
+
+	if newOK {
+		s.owned.TrackResolved(newKey, newCloser)
+		s.aliases.Inc(newKey)
+	}
+
+	return val
+}
+
+// copyRegister moves a value from one register to another, transferring ownership if any.
+// Use this for explicit register moves (OpMove) where:
+//   - source register will be overwritten or cleared soon
+//   - you want to avoid aliasing complexity
+//
+// This is semantically a copy, but ownership stays with the value, not the slot.
+// If the copied value is an owned closer, its alias count is incremented.
+func (s *execState) copyRegister(dst, src bytecode.Operand) runtime.Value {
+	if !src.IsRegister() {
+		return s.writeBorrowedRegister(dst, runtime.None)
+	}
+
+	if !dst.IsRegister() {
+		return s.registers[src]
+	}
+
+	val := s.registers[src]
+	if !mem.CanTrackValue(val) {
+		return s.writeBorrowedRegister(dst, val)
+	}
+
+	prev := s.registers[dst]
+	valKey, _, valTrackable := mem.ResourceKeyOf(val)
+	valOwned := valTrackable && s.owned.OwnsKey(valKey)
+
+	if !mem.CanTrackValue(prev) {
+		s.registers[dst] = val
+
+		if valOwned {
+			s.aliases.Inc(valKey)
+		}
+
+		return val
+	}
+
+	prevKey, prevCloser, ok := mem.ResourceKeyOf(prev)
+
+	if !ok || !s.owned.OwnsKey(prevKey) {
+		s.registers[dst] = val
+		if valOwned {
+			s.aliases.Inc(valKey)
+		}
+
+		return val
+	}
+
+	if !valOwned || prevKey != valKey {
+		s.decAliasAndMaybeDiscard(prevKey, prevCloser)
+	}
+
+	s.registers[dst] = val
+
+	if valOwned {
+		s.aliases.Inc(valKey)
+	}
+
+	return val
+}
+
+// clearRegister clears a register, setting it to None and discarding any owned value.
+// Use this for explicit register cleanup when you don't need to set a new value.
+func (s *execState) clearRegister(dst bytecode.Operand) {
+	if !dst.IsRegister() {
+		return
+	}
+
+	prev := s.registers[dst]
+
+	if !mem.CanTrackValue(prev) {
+		s.registers[dst] = runtime.None
+		return
+	}
+
+	if key, closer, ok := mem.ResourceKeyOf(prev); ok && s.owned.OwnsKey(key) {
+		s.decAliasAndMaybeDiscard(key, closer)
+	}
+
+	s.registers[dst] = runtime.None
+}
+
+func (s *execState) udfByID(id bytecode.FunctionID) (*bytecode.UDF, error) {
+	if s.program == nil || !id.InRange(len(s.program.Functions.UserDefined)) {
+		return nil, ErrUnresolvedFunction
+	}
+
+	return &s.program.Functions.UserDefined[id], nil
+}

@@ -1,0 +1,197 @@
+package optimization
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+func TestRegisterCoalescing_CoalescesWhenSrcDies(t *testing.T) {
+	program := &bytecode.Program{
+		Constants: []runtime.Value{
+			runtime.Int(10),
+		},
+		Registers: 4,
+		Bytecode: []bytecode.Instruction{
+			bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+			bytecode.NewInstruction(bytecode.OpMove, bytecode.NewRegister(2), bytecode.NewRegister(1)),
+			bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(3), bytecode.NewRegister(2), bytecode.NewRegister(2)),
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(3)),
+		},
+	}
+
+	runCoalescing(t, program)
+
+	expected := []bytecode.Instruction{
+		bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+		bytecode.NewInstruction(bytecode.OpMove, bytecode.NewRegister(1), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(1), bytecode.NewRegister(1), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(1)),
+	}
+
+	assertBytecodeEqual(t, program.Bytecode, expected)
+}
+
+func TestRegisterCoalescing_NoCoalesceWhenInterfering(t *testing.T) {
+	program := &bytecode.Program{
+		Constants: []runtime.Value{
+			runtime.Int(1),
+		},
+		Registers: 4,
+		Bytecode: []bytecode.Instruction{
+			bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+			bytecode.NewInstruction(bytecode.OpMove, bytecode.NewRegister(2), bytecode.NewRegister(1)),
+			bytecode.NewInstruction(bytecode.OpIncr, bytecode.NewRegister(2)),
+			bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(3), bytecode.NewRegister(2), bytecode.NewRegister(1)),
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(3)),
+		},
+	}
+
+	runCoalescing(t, program)
+
+	expected := []bytecode.Instruction{
+		bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+		bytecode.NewInstruction(bytecode.OpMove, bytecode.NewRegister(2), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpIncr, bytecode.NewRegister(2)),
+		bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(1), bytecode.NewRegister(2), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(1)),
+	}
+
+	assertBytecodeEqual(t, program.Bytecode, expected)
+}
+
+func TestRegisterCoalescing_NoCoalesceForRangeSensitiveRegs(t *testing.T) {
+	program := &bytecode.Program{
+		Constants: []runtime.Value{
+			runtime.Int(1),
+			runtime.Int(2),
+		},
+		Registers: 6,
+		Bytecode: []bytecode.Instruction{
+			bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+			bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(2), bytecode.NewConstant(1)),
+			bytecode.NewInstruction(bytecode.OpMove, bytecode.NewRegister(3), bytecode.NewRegister(1)),
+			bytecode.NewInstruction(bytecode.OpHCall, bytecode.NewRegister(4), bytecode.NewRegister(1), bytecode.NewRegister(2)),
+			bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(5), bytecode.NewRegister(3), bytecode.NewRegister(1)),
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(5)),
+		},
+	}
+
+	runCoalescing(t, program)
+
+	expected := []bytecode.Instruction{
+		bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+		bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(2), bytecode.NewConstant(1)),
+		bytecode.NewInstruction(bytecode.OpMove, bytecode.NewRegister(3), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpHCall, bytecode.NewRegister(4), bytecode.NewRegister(1), bytecode.NewRegister(2)),
+		bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(3), bytecode.NewRegister(3), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(3)),
+	}
+
+	assertBytecodeEqual(t, program.Bytecode, expected)
+}
+
+func TestRegisterCoalescing_PinsCellHandleRegisters(t *testing.T) {
+	program := &bytecode.Program{
+		Constants: []runtime.Value{
+			runtime.Int(1),
+			runtime.Int(2),
+		},
+		Registers: 8,
+		Bytecode: []bytecode.Instruction{
+			bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(3), bytecode.NewConstant(0)),
+			bytecode.NewInstruction(bytecode.OpMakeCell, bytecode.NewRegister(5), bytecode.NewRegister(3)),
+			bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(6), bytecode.NewConstant(1)),
+			bytecode.NewInstruction(bytecode.OpStoreCell, bytecode.NewRegister(5), bytecode.NewRegister(6)),
+			bytecode.NewInstruction(bytecode.OpLoadCell, bytecode.NewRegister(7), bytecode.NewRegister(5)),
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(7)),
+		},
+	}
+
+	runCoalescing(t, program)
+
+	expected := []bytecode.Instruction{
+		bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(0)),
+		bytecode.NewInstruction(bytecode.OpMakeCell, bytecode.NewRegister(5), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpLoadConst, bytecode.NewRegister(1), bytecode.NewConstant(1)),
+		bytecode.NewInstruction(bytecode.OpStoreCell, bytecode.NewRegister(5), bytecode.NewRegister(1)),
+		bytecode.NewInstruction(bytecode.OpLoadCell, bytecode.NewRegister(1), bytecode.NewRegister(5)),
+		bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(1)),
+	}
+
+	assertBytecodeEqual(t, program.Bytecode, expected)
+}
+
+func TestUpdateRegisterCount_UpdatesUDFWindows(t *testing.T) {
+	program := &bytecode.Program{
+		Registers: 7,
+		Functions: bytecode.Functions{
+			UserDefined: []bytecode.UDF{
+				{Name: "first", Entry: 1, Registers: 4, Params: 2},
+				{Name: "second", Entry: 3, Registers: 3, Params: 2},
+			},
+		},
+		Bytecode: []bytecode.Instruction{
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(1)),
+			bytecode.NewInstruction(bytecode.OpAdd, bytecode.NewRegister(6), bytecode.NewRegister(1), bytecode.NewRegister(2)),
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(6)),
+			bytecode.NewInstruction(bytecode.OpReturn, bytecode.NewRegister(2)),
+		},
+	}
+
+	if !updateRegisterCount(program) {
+		t.Fatal("expected register metadata update")
+	}
+
+	if got, want := program.Functions.UserDefined[0].Registers, 7; got != want {
+		t.Fatalf("unexpected first UDF register count: got %d, want %d", got, want)
+	}
+
+	if got, want := program.Functions.UserDefined[1].Registers, 3; got != want {
+		t.Fatalf("unexpected second UDF register count: got %d, want %d", got, want)
+	}
+}
+
+func runCoalescing(t *testing.T, program *bytecode.Program) {
+	t.Helper()
+
+	p := NewPipeline()
+	p.Add(NewLivenessAnalysisPass())
+	p.Add(NewRegisterCoalescingPass())
+
+	if _, err := p.Run(program); err != nil {
+		t.Fatalf("coalescing pipeline failed: %v", err)
+	}
+}
+
+func TestDestructureAssertionRegisterOperandClassification(t *testing.T) {
+	if !operandIsRegister(bytecode.OpAssertDestructure, 0) {
+		t.Fatal("expected destructure source to be a register operand")
+	}
+
+	if operandIsRegister(bytecode.OpAssertDestructure, 1) || operandIsRegister(bytecode.OpAssertDestructure, 2) {
+		t.Fatal("expected destructure mode and trailing operand to remain immediates")
+	}
+}
+
+func TestLiteralSpreadRegisterOperandClassification(t *testing.T) {
+	for _, op := range []bytecode.Opcode{bytecode.OpArraySpread, bytecode.OpObjectSpread} {
+		if !operandIsRegister(op, 0) || !operandIsRegister(op, 1) {
+			t.Fatalf("expected both %s operands to be registers", op)
+		}
+
+		if operandIsRegister(op, 2) {
+			t.Fatalf("expected trailing %s operand to remain immediate", op)
+		}
+	}
+}
+
+func assertBytecodeEqual(t *testing.T, got, want []bytecode.Instruction) {
+	t.Helper()
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("bytecode mismatch:\nexpected: %#v\ngot: %#v", want, got)
+	}
+}

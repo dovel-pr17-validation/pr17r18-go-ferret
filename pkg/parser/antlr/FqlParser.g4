@@ -1,0 +1,1433 @@
+// $antlr-format off <-- used by VS Code Antlr extension
+
+parser grammar FqlParser;
+
+options { tokenVocab=FqlLexer; }
+
+@parser::members {
+	func (p *FqlParser) isWaitForPredicateStart() bool {
+		la1 := p.GetTokenStream().LA(1)
+		if la1 == FqlParserExists || la1 == FqlParserValue {
+			return true
+		}
+		return la1 == FqlParserNot && p.GetTokenStream().LA(2) == FqlParserExists
+	}
+
+	func (p *FqlParser) isWaitForEventGroupStart() bool {
+		offset := p.waitForLookaheadOffset()
+		return p.GetTokenStream().LA(offset) == FqlParserEvent &&
+			p.isWaitForSynchronizationToken(p.GetTokenStream().LA(offset + 1)) &&
+			p.GetTokenStream().LA(offset + 2) == FqlParserOpenBrace
+	}
+
+	func (p *FqlParser) isWaitForPredicateGroupStart() bool {
+		offset := p.waitForLookaheadOffset()
+		switch p.GetTokenStream().LA(offset) {
+		case FqlParserAny, FqlParserAll:
+			return p.GetTokenStream().LA(offset + 1) == FqlParserOpenBrace
+		case FqlParserExists, FqlParserValue:
+			return p.isWaitForSynchronizationToken(p.GetTokenStream().LA(offset + 1)) &&
+				p.GetTokenStream().LA(offset + 2) == FqlParserOpenBrace
+		case FqlParserNot:
+			return p.GetTokenStream().LA(offset + 1) == FqlParserExists &&
+				p.isWaitForSynchronizationToken(p.GetTokenStream().LA(offset + 2)) &&
+				p.GetTokenStream().LA(offset + 3) == FqlParserOpenBrace
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) waitForLookaheadOffset() int {
+		if p.GetTokenStream().LA(1) == FqlParserWaitfor {
+			return 2
+		}
+
+		return 1
+	}
+
+	func (p *FqlParser) isWaitForSynchronizationToken(token int) bool {
+		return token == FqlParserAny || token == FqlParserAll
+	}
+
+	func (p *FqlParser) pushImplicitCurrent() {
+		p.implicitCurrentDepth++
+	}
+
+	func (p *FqlParser) popImplicitCurrent() {
+		if p.implicitCurrentDepth > 0 {
+			p.implicitCurrentDepth--
+		}
+	}
+
+	func (p *FqlParser) allowImplicitCurrent() bool {
+		return p.implicitCurrentDepth > 0
+	}
+
+	func (p *FqlParser) isSafeReservedWordToken(token int) bool {
+		switch token {
+		case FqlParserAnd, FqlParserOr, FqlParserAs, FqlParserDistinct, FqlParserFilter, FqlParserSort,
+			FqlParserLimit, FqlParserCollect, FqlParserSortDirection, FqlParserInto, FqlParserKeep, FqlParserWith,
+			FqlParserAll, FqlParserAny, FqlParserAt, FqlParserLeast, FqlParserAggregate, FqlParserEvent, FqlParserTimeout,
+			FqlParserOptions, FqlParserEvery, FqlParserBackoff, FqlParserJitter, FqlParserExists, FqlParserValue,
+			FqlParserOne, FqlParserCount, FqlParserTrigger:
+			return true
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) isQueryModifierAhead() bool {
+		la1 := p.GetTokenStream().LA(1)
+		switch la1 {
+		case FqlParserExists, FqlParserCount, FqlParserOne:
+			return true
+		case FqlParserIdentifier:
+			tok := p.GetTokenStream().LT(1)
+			if tok == nil {
+				return false
+			}
+
+			return p.isQueryModifierText(tok.GetText())
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) isReturnDistinctAhead() bool {
+		return p.GetTokenStream().LA(1) == FqlParserDistinct
+	}
+
+	func (p *FqlParser) isQueryModifierText(text string) bool {
+		return equalsFoldAscii(text, "EXISTS") ||
+			equalsFoldAscii(text, "COUNT") ||
+			equalsFoldAscii(text, "ONE")
+	}
+
+	func (p *FqlParser) isCurrentIdentifierText(expected string) bool {
+		tok := p.GetTokenStream().LT(1)
+		if tok == nil || tok.GetTokenType() != FqlParserIdentifier {
+			return false
+		}
+
+		return equalsFoldAscii(tok.GetText(), expected)
+	}
+
+	func (p *FqlParser) isRecoveryConditionAhead() bool {
+		switch p.GetTokenStream().LA(2) {
+		case FqlParserTimeout, FqlParserIdentifier:
+			return true
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) isRecoveryActionAhead() bool {
+		switch p.GetTokenStream().LA(3) {
+		case FqlParserReturn:
+			return true
+		case FqlParserIdentifier:
+			tok := p.GetTokenStream().LT(3)
+			return tok != nil && !equalsFoldAscii(tok.GetText(), "ON")
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) hasNonWhitespaceSource() bool {
+		if p.GetTokenStream().LA(1) != FqlParserEOF {
+			return true
+		}
+
+		for i := 0; i < p.GetTokenStream().Index(); i++ {
+			switch p.GetTokenStream().Get(i).GetTokenType() {
+			case FqlParserWhiteSpaces, FqlParserLineTerminator:
+				continue
+			default:
+				return true
+			}
+		}
+
+		return false
+	}
+
+	func equalsFoldAscii(actual, expected string) bool {
+		if len(actual) != len(expected) {
+			return false
+		}
+
+		for i := 0; i < len(actual); i++ {
+			a := actual[i]
+			e := expected[i]
+
+			if a >= 'a' && a <= 'z' {
+				a -= 'a' - 'A'
+			}
+
+			if e >= 'a' && e <= 'z' {
+				e -= 'a' - 'A'
+			}
+
+			if a != e {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	func (p *FqlParser) isUnsafeReservedWordToken(token int) bool {
+		switch token {
+		case FqlParserReturn, FqlParserDispatch, FqlParserDelete, FqlParserQuery, FqlParserUsing, FqlParserNone,
+			FqlParserNull, FqlParserLet, FqlParserVar, FqlParserUse, FqlParserWaitfor, FqlParserWhile, FqlParserDo, FqlParserIn,
+			FqlParserLike, FqlParserNot, FqlParserFor, FqlParserBooleanLiteral, FqlParserMatch, FqlParserWhen,
+			FqlParserFunc:
+			return true
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) isImplicitCurrentValue() bool {
+		la1 := p.GetTokenStream().LA(2)
+		if la1 == FqlParserUsing {
+			return true
+		}
+
+		switch la1 {
+		case FqlParserIdentifier, FqlParserStringLiteral, FqlParserParam, FqlParserOpenBracket, FqlParserBacktickOpen:
+			return false
+		}
+
+		if p.isSafeReservedWordToken(la1) || p.isUnsafeReservedWordToken(la1) {
+			return false
+		}
+
+		return true
+	}
+
+	func (p *FqlParser) isAssignmentStatementStart() bool {
+		next, ok := p.scanAssignmentTarget(1)
+		if !ok {
+			return false
+		}
+
+		switch p.GetTokenStream().LA(next) {
+		case FqlParserAssign, FqlParserPlusAssign, FqlParserMinusAssign, FqlParserMultiAssign, FqlParserDivAssign:
+			return true
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) isForExpressionClauseStart() bool {
+		switch p.GetTokenStream().LA(1) {
+		case FqlParserFilter, FqlParserSort, FqlParserLimit, FqlParserCollect:
+		default:
+			return false
+		}
+
+		switch p.GetTokenStream().LA(2) {
+		case FqlParserDot, FqlParserOpenBracket, FqlParserOpenParen, FqlParserQuestionMark:
+			keyword := p.GetTokenStream().LT(1)
+			continuation := p.GetTokenStream().LT(2)
+			return keyword == nil || continuation == nil || keyword.GetStop() + 1 != continuation.GetStart()
+		case FqlParserGt, FqlParserLt, FqlParserEq, FqlParserGte, FqlParserLte, FqlParserNeq,
+			FqlParserMulti, FqlParserDiv, FqlParserMod, FqlParserPlus, FqlParserMinus,
+			FqlParserAnd, FqlParserOr, FqlParserCoalesce, FqlParserRegexNotMatch,
+			FqlParserRegexMatch, FqlParserRange, FqlParserIn, FqlParserLike,
+			FqlParserDispatchReceive:
+			return false
+		default:
+			return true
+		}
+	}
+
+	// FQL has no statement terminator, so accepting every expression start here
+	// could split a continuation from the expression before it. Historically
+	// unambiguous function-call, WAITFOR, and DISPATCH statements may start on the
+	// same line. Assignments and FOR clauses are classified first so their targets
+	// and contextual keywords are not stolen. The invariant is that a general
+	// expression starts only where the surrounding expression cannot continue.
+	func (p *FqlParser) isGeneralExpressionStatementStart() bool {
+		if p.GetTokenStream().LA(1) == FqlParserReturn || p.isAssignmentStatementStart() {
+			return false
+		}
+
+		if p.isFunctionCallStart() || p.GetTokenStream().LA(1) == FqlParserWaitfor || p.GetTokenStream().LA(1) == FqlParserDispatch {
+			return true
+		}
+
+		if p.isTrailingQuoteAfterCurrent() {
+			return true
+		}
+
+		switch p.GetTokenStream().LA(1) {
+		case FqlParserAnd, FqlParserOr, FqlParserSortDirection, FqlParserAggregate, FqlParserInto,
+			FqlParserKeep, FqlParserWith, FqlParserOptions, FqlParserTimeout, FqlParserEvery,
+			FqlParserBackoff, FqlParserJitter, FqlParserTrigger:
+			return false
+		}
+
+		current := p.GetTokenStream().LT(1)
+		previous := p.GetTokenStream().LT(-1)
+		if current == nil || previous == nil {
+			return true
+		}
+
+		if current.GetLine() > previous.GetLine() {
+			return true
+		}
+
+		switch previous.GetTokenType() {
+		case FqlParserOpenBrace, FqlParserCloseBrace:
+			return true
+		default:
+			return false
+		}
+	}
+
+	func (p *FqlParser) isForExpressionStatementStart() bool {
+		if p.isForExpressionClauseStart() {
+			switch p.GetTokenStream().LA(1) {
+			case FqlParserLimit:
+				return p.GetTokenStream().LA(2) == FqlParserComma
+			case FqlParserCollect:
+				return p.GetTokenStream().LA(2) == FqlParserAssign
+			default:
+				return false
+			}
+		}
+
+		return p.isGeneralExpressionStatementStart()
+	}
+
+	func (p *FqlParser) isForExpressionBodyStatementStart() bool {
+		switch p.GetTokenStream().LA(1) {
+		case FqlParserLet, FqlParserVar, FqlParserDelete, FqlParserFor:
+			return true
+		}
+
+		if p.isAssignmentStatementStart() {
+			return true
+		}
+
+		return p.isForExpressionStatementStart()
+	}
+
+	func (p *FqlParser) isTrailingQuoteAfterCurrent() bool {
+		next := p.GetTokenStream().LT(2)
+		if next == nil {
+			return false
+		}
+
+		if next.GetTokenType() == FqlParserBacktickOpen {
+			return true
+		}
+
+		if next.GetTokenType() != FqlParserUnknownIdentifier {
+			return false
+		}
+
+		return next.GetText() == "\"" || next.GetText() == "'"
+	}
+
+	func (p *FqlParser) isFunctionCallStart() bool {
+		offset := 1
+		for p.GetTokenStream().LA(offset) == FqlParserNamespaceSegment {
+			offset++
+		}
+
+		if p.GetTokenStream().LA(offset + 1) != FqlParserOpenParen {
+			return false
+		}
+
+		token := p.GetTokenStream().LA(offset)
+		return token == FqlParserIdentifier || p.isSafeReservedWordToken(token) || p.isUnsafeReservedWordToken(token)
+	}
+
+	func (p *FqlParser) scanAssignmentTarget(offset int) (int, bool) {
+		if !p.isBindingIdentifierStart(p.GetTokenStream().LA(offset)) {
+			return offset, false
+		}
+
+		offset++
+
+		for {
+			switch p.GetTokenStream().LA(offset) {
+			case FqlParserQuestionMark:
+				if p.GetTokenStream().LA(offset + 1) != FqlParserDot {
+					return offset, true
+				}
+
+				if p.GetTokenStream().LA(offset + 2) == FqlParserOpenBracket {
+					next, ok := p.skipComputedProperty(offset + 2)
+					if !ok {
+						return offset, false
+					}
+
+					offset = next
+					continue
+				}
+
+				if !p.isPropertyNameStart(p.GetTokenStream().LA(offset + 2)) {
+					return offset, false
+				}
+
+				offset += 3
+			case FqlParserDot:
+				if !p.isPropertyNameStart(p.GetTokenStream().LA(offset + 1)) {
+					return offset, false
+				}
+
+				offset += 2
+			case FqlParserOpenBracket:
+				next, ok := p.skipComputedProperty(offset)
+				if !ok {
+					return offset, false
+				}
+
+				offset = next
+			default:
+				return offset, true
+			}
+		}
+	}
+
+	func (p *FqlParser) isBindingIdentifierStart(token int) bool {
+		return token == FqlParserIdentifier || p.isSafeReservedWordToken(token)
+	}
+
+	func (p *FqlParser) isPropertyNameStart(token int) bool {
+		return token == FqlParserIdentifier || token == FqlParserStringLiteral || token == FqlParserParam ||
+			p.isSafeReservedWordToken(token) || p.isUnsafeReservedWordToken(token)
+	}
+
+	func (p *FqlParser) skipComputedProperty(offset int) (int, bool) {
+		depth := 0
+
+		for {
+			switch p.GetTokenStream().LA(offset) {
+			case FqlParserEOF:
+				return offset, false
+			case FqlParserOpenBracket, FqlParserOpenParen, FqlParserOpenBrace:
+				depth++
+			case FqlParserCloseBracket, FqlParserCloseParen, FqlParserCloseBrace:
+				depth--
+				if depth == 0 {
+					return offset + 1, true
+				}
+				if depth < 0 {
+					return offset, false
+				}
+			}
+
+			offset++
+		}
+	}
+}
+
+@parser::structmembers {
+	implicitCurrentDepth int
+}
+
+program
+    : head* body EOF
+    ;
+
+head
+    : useExpression
+    ;
+
+useExpression
+    : use
+    ;
+
+use
+    : Use namespaceIdentifier As alias=Identifier
+    ;
+
+body
+    : {p.hasNonWhitespaceSource()}? bodyStatement* bodyExpression?
+    ;
+
+bodyStatement
+    : variableDeclaration
+    | assignmentStatement
+    | deleteStatement
+    | functionDeclaration
+    | forExpression
+    | {p.isGeneralExpressionStatementStart()}? expressionStatement
+    ;
+
+bodyExpression
+    : returnExpression
+    ;
+
+variableDeclaration
+    : Let id=(Identifier | IgnoreIdentifier) Assign expression
+    | Let safeReservedWord Assign expression
+    | Var (bindingIdentifier | IgnoreIdentifier) Assign expression
+    | (Let | Var) structuredBindingPattern Assign expression
+    ;
+
+assignmentStatement
+    : assignmentTarget assignmentOperator expression
+    ;
+
+deleteStatement
+    : Delete assignmentTarget
+    ;
+
+assignmentTarget
+    : bindingIdentifier assignmentTargetPath*
+    ;
+
+assignmentTargetPath
+    : errorOperator? Dot propertyName
+    | (errorOperator Dot)? computedPropertyName
+    ;
+
+assignmentOperator
+    : Assign
+    | PlusAssign
+    | MinusAssign
+    | MultiAssign
+    | DivAssign
+    ;
+
+functionDeclaration
+    : Func functionName OpenParen functionParameterList? CloseParen functionBody
+    ;
+
+functionParameterList
+    : functionParameter (Comma functionParameter)* Comma?
+    ;
+
+functionParameter
+    : bindingIdentifier
+    ;
+
+functionBody
+    : functionArrow
+    | functionBlock
+    ;
+
+functionArrow
+    : Arrow expression
+    ;
+
+functionBlock
+    : OpenBrace functionStatement* functionReturn? CloseBrace
+    ;
+
+functionStatement
+    : variableDeclaration
+    | assignmentStatement
+    | deleteStatement
+    | functionDeclaration
+    | forExpression
+    | {p.isGeneralExpressionStatementStart()}? expressionStatement
+    ;
+
+expressionStatement
+    : expression
+    ;
+
+functionReturn
+    : Return (Distinct returnValue | {!p.isReturnDistinctAhead()}? returnValue)
+    ;
+
+returnExpression
+    : Return (Distinct returnValue | {!p.isReturnDistinctAhead()}? returnValue)
+    ;
+
+returnValue
+    : forExpression
+    | expression
+    ;
+
+forExpression
+    : For (valueVariable=loopVariable | valuePattern=structuredBindingPattern) (Comma counterVariable=bindingIdentifier)? In forExpressionSource
+        (OpenBrace forExpressionBody* returnExpression? CloseBrace
+        | forExpressionBody* forExpressionReturn)
+    | For (valueVariable=loopVariable)? Do? While expression
+        (OpenBrace forExpressionBody* returnExpression? CloseBrace
+        | forExpressionBody* forExpressionReturn)
+    ;
+
+forExpressionSource
+    : expression
+    ;
+
+forExpressionClause
+    : limitClause
+    | sortClause
+    | filterClause
+    | collectClause
+    ;
+
+forExpressionStatement
+    : variableDeclaration
+    | assignmentStatement
+    | deleteStatement
+    | forExpression
+    | {p.isForExpressionStatementStart()}? expressionStatement
+    ;
+
+forExpressionBody
+    : {p.isForExpressionClauseStart()}? forExpressionClause
+    | {p.isForExpressionBodyStatementStart()}? forExpressionStatement
+    ;
+
+forExpressionReturn
+    : returnExpression
+    | forExpression
+    ;
+
+filterClause
+    : Filter expression
+    ;
+
+eventFilterClause
+    : When {p.pushImplicitCurrent()} expression {p.popImplicitCurrent()}
+    ;
+
+waitForPredicateWhenClause
+    : When {p.pushImplicitCurrent()} expression {p.popImplicitCurrent()}
+    ;
+
+limitClause
+    : Limit limitClauseValue (Comma limitClauseValue)?
+    ;
+
+limitClauseValue
+    : integerLiteral
+    | param
+    | memberExpression
+    | functionCallExpression
+    | implicitCurrentExpression
+    | {p.allowImplicitCurrent()}? implicitMemberExpression
+    | variable
+    ;
+
+sortClause
+    : Sort sortClauseExpression (Comma sortClauseExpression)*
+    ;
+
+sortClauseExpression
+    : expression SortDirection?
+    ;
+
+collectClause
+  : Collect collectGrouping collectAggregator collectGroupProjection
+  | Collect collectGrouping collectAggregator
+  | Collect collectGrouping collectGroupProjection
+  | Collect collectGrouping collectCounter
+  | Collect collectGrouping
+  | Collect collectAggregator collectGroupProjection
+  | Collect collectAggregator
+  | Collect collectCounter
+  ;
+
+bindingIdentifier
+    : Identifier
+    | safeReservedWord
+    ;
+
+loopVariable
+    : bindingIdentifier
+    | IgnoreIdentifier
+    ;
+
+collectSelector
+    : bindingIdentifier Assign expression
+    ;
+
+collectGrouping
+    : collectSelector (Comma collectSelector)*
+    ;
+
+collectAggregateSelector
+    : bindingIdentifier Assign functionCallExpression
+    ;
+
+collectAggregator
+    : Aggregate collectAggregateSelector (Comma collectAggregateSelector)*
+    ;
+
+collectGroupProjection
+    : Into collectSelector
+    | Into bindingIdentifier (collectGroupProjectionFilter)?
+    ;
+
+collectGroupProjectionFilter
+    : Keep Identifier (Comma Identifier)*
+    ;
+
+collectCounter
+    : With Count Into bindingIdentifier
+    ;
+
+waitForExpression
+    : Waitfor (
+        {p.isWaitForEventGroupStart()}? waitForEventGroupExpression (recoveryTails)?
+        | {p.isWaitForPredicateGroupStart()}? waitForPredicateGroupExpression (recoveryTails)?
+        | {!p.isWaitForEventGroupStart()}? waitForEventExpression (recoveryTails)?
+        | {!p.isWaitForPredicateGroupStart()}? waitForPredicateExpression (recoveryTails)?
+      )
+    ;
+
+dispatchExpression
+    : Dispatch dispatchEventName In dispatchTarget (dispatchWithClause)? (dispatchOptionsClause)? (recoveryTails)?
+    | dispatchTarget DispatchReceive dispatchEventName (recoveryTails)?
+    ;
+
+dispatchEventName
+    : stringLiteral
+    | variable
+    | param
+    | memberExpression
+    | functionCall
+    ;
+
+dispatchTarget
+    : functionCallExpression
+    | variable
+    | param
+    | memberExpression
+    | OpenParen expression CloseParen
+    ;
+
+dispatchWithClause
+    : With expression
+    ;
+
+dispatchOptionsClause
+    : Options expression
+    ;
+
+waitForEventExpression
+    : Event waitForEventName In waitForEventSource (optionsClause)? (eventFilterClause)* waitForEventTail
+    ;
+
+waitForEventGroupExpression
+    : Event waitForSynchronization OpenBrace
+      (CloseBrace {p.NotifyErrorListeners("empty WAITFOR group", p.GetTokenStream().LT(-1), nil)}
+      | waitForEventGroupEntry+ CloseBrace)
+      waitForEventTail
+    ;
+
+waitForEventGroupEntry
+    : waitForEventName In waitForEventSource (optionsClause)? (eventFilterClause)*
+    ;
+
+waitForEventTail
+    : waitForTriggerClause (timeoutClause)?
+    | timeoutClause
+    | {p.GetTokenStream().LA(1) != FqlParserTrigger && p.GetTokenStream().LA(1) != FqlParserTimeout}?
+    ;
+
+waitForTriggerClause
+    : Trigger OpenParen waitForTriggerStatement* CloseParen
+    | Trigger {p.GetTokenStream().LA(1) != FqlParserOpenParen}? waitForTriggerInlineStatement
+    ;
+
+waitForTriggerStatement
+    : variableDeclaration
+    | assignmentStatement
+    | deleteStatement
+    | functionCallExpression
+    | waitForExpression
+    | dispatchExpression
+    ;
+
+waitForTriggerInlineStatement
+    : variableDeclaration
+    | assignmentStatement
+    | deleteStatement
+    | functionCallNoRecoveryExpression
+    | waitForTriggerInlineDispatchStatement
+    ;
+
+waitForTriggerInlineDispatchStatement
+    : Dispatch dispatchEventName In dispatchTarget (dispatchWithClause)? (dispatchOptionsClause)?
+    | dispatchTarget DispatchReceive dispatchEventName
+    ;
+
+waitForPredicateExpression
+    : waitForPredicate (waitForPredicateWhenClause)* (timeoutClause)? (everyClause)? (backoffClause)? (jitterClause)?
+    ;
+
+waitForPredicateGroupExpression
+    : waitForPredicateGroupMode? waitForSynchronization OpenBrace
+      (CloseBrace {p.NotifyErrorListeners("empty WAITFOR group", p.GetTokenStream().LT(-1), nil)}
+      | waitForPredicateGroupEntry+ CloseBrace)
+      (timeoutClause)? (everyClause)? (backoffClause)? (jitterClause)?
+    ;
+
+waitForPredicateGroupMode
+    : Exists
+    | Not Exists
+    | Value
+    ;
+
+waitForPredicateGroupEntry
+    : expression (waitForPredicateWhenClause)*
+    ;
+
+waitForSynchronization
+    : Any
+    | All
+    ;
+
+waitForPredicate
+    : Exists expression
+    | Not Exists expression
+    | Value expression
+    | {!p.isWaitForPredicateStart() && p.GetTokenStream().LA(1) != FqlParserEvent}? expression
+    ;
+
+waitForEventName
+    : expression
+    ;
+
+waitForEventSource
+    : expression
+    ;
+
+optionsClause
+    : Options objectLiteral
+    ;
+
+timeoutClause
+    : Timeout expression
+    ;
+
+everyClause
+    : Every everyClauseValue (Comma everyClauseValue)?
+    ;
+
+everyClauseValue
+    : expression
+    ;
+
+backoffClause
+    : Backoff backoffStrategy
+    ;
+
+jitterClause
+    : Jitter jitterClauseValue
+    ;
+
+jitterClauseValue
+    : floatLiteral
+    | integerLiteral
+    | variable
+    | param
+    | memberExpression
+    | functionCall
+    ;
+
+backoffStrategy
+    : Identifier
+    | stringLiteral
+    | None
+    ;
+
+recoveryTails
+    : ({p.isCurrentIdentifierText("ON")}? recoveryTail)+
+    ;
+
+recoveryTail
+    : {p.isRecoveryActionAhead()}? onKeyword recoveryCondition recoveryAction
+    | {p.isRecoveryConditionAhead() && !p.isRecoveryActionAhead()}? onKeyword recoveryCondition
+    | {!p.isRecoveryConditionAhead()}? onKeyword
+    ;
+
+recoveryCondition
+    : errorKeyword
+    | timeoutKeyword
+    | {!p.isCurrentIdentifierText("ERROR")}? Identifier
+    ;
+
+recoveryAction
+    : failKeyword recoveryActionOrClause?
+    | returnKeyword recoveryReturnExpr
+    | returnKeyword
+    | recoveryRetryAction
+    | {!p.isCurrentIdentifierText("FAIL") && !p.isCurrentIdentifierText("RETRY")}? Identifier recoveryActionOrClause?
+    ;
+
+recoveryReturnExpr
+    : expression
+    ;
+
+recoveryRetryAction
+    : retryKeyword recoveryRetryCount? recoveryRetryDelayClause? recoveryRetryOrClause*
+    ;
+
+recoveryRetryCount
+    : integerLiteral
+    ;
+
+recoveryRetryDelayClause
+    : delayKeyword recoveryRetryDelayValue? recoveryRetryBackoffClause?
+    | recoveryRetryBackoffClause
+    ;
+
+recoveryRetryDelayValue
+    : unaryOperator? predicate
+    ;
+
+recoveryRetryBackoffClause
+    : Backoff recoveryRetryBackoffKind?
+    ;
+
+recoveryRetryBackoffKind
+    : Identifier
+    | stringLiteral
+    | None
+    ;
+
+recoveryRetryOrClause
+    : Or recoveryRetryFinalAction?
+    ;
+
+recoveryRetryFinalAction
+    : failKeyword
+    | returnKeyword recoveryReturnExpr
+    | returnKeyword
+    | {!p.isCurrentIdentifierText("FAIL") && !p.isCurrentIdentifierText("RETURN")}? Identifier
+    ;
+
+recoveryActionOrClause
+    : Or recoveryRetryFinalAction?
+    ;
+
+onKeyword
+    : {p.isCurrentIdentifierText("ON")}? Identifier
+    ;
+
+errorKeyword
+    : {p.isCurrentIdentifierText("ERROR")}? Identifier
+    ;
+
+timeoutKeyword
+    : Timeout
+    ;
+
+failKeyword
+    : {p.isCurrentIdentifierText("FAIL")}? Identifier
+    ;
+
+retryKeyword
+    : {p.isCurrentIdentifierText("RETRY")}? Identifier
+    ;
+
+delayKeyword
+    : {p.isCurrentIdentifierText("DELAY")}? Identifier
+    ;
+
+returnKeyword
+    : Return
+    ;
+
+param
+    : Param Identifier
+    | Param safeReservedWord
+    ;
+
+variable
+    : Identifier
+    | safeReservedWord
+    ;
+
+literal
+    : arrayLiteral
+    | objectLiteral
+    | booleanLiteral
+    | stringLiteral
+    | durationLiteral
+    | floatLiteral
+    | integerLiteral
+    | noneLiteral
+    ;
+
+arrayLiteral
+    : OpenBracket (arrayEntry (Comma arrayEntry)* Comma?)? CloseBracket
+    ;
+
+objectLiteral
+    : OpenBrace (objectEntry (Comma objectEntry)* Comma?)? CloseBrace
+    ;
+
+arrayEntry
+    : expression
+    | spreadEntry
+    ;
+
+objectEntry
+    : propertyAssignment
+    | spreadEntry
+    ;
+
+spreadEntry
+    : Ellipsis expression
+    ;
+
+booleanLiteral
+    : BooleanLiteral
+    ;
+
+stringLiteral
+    : StringLiteral
+    | templateLiteral
+    ;
+
+templateLiteral
+    : BacktickOpen templateElement* BacktickClose
+    ;
+
+templateElement
+    : TemplateChars
+    | TemplateExprStart expression TemplateExprEnd
+    ;
+
+floatLiteral
+    : FloatLiteral
+    ;
+
+integerLiteral
+    : IntegerLiteral
+    ;
+
+noneLiteral
+    : Null
+    | None
+    ;
+
+propertyAssignment
+    : propertyName Colon expression
+    | computedPropertyName Colon expression
+    | variable
+    ;
+
+computedPropertyName
+    : OpenBracket expression CloseBracket
+    ;
+
+propertyName
+    : Identifier
+    | stringLiteral
+    | param
+    | safeReservedWord
+    | unsafeReservedWord
+    ;
+
+namespaceIdentifier
+    : namespace Identifier
+    ;
+
+namespace
+    : NamespaceSegment*
+    ;
+
+memberExpression
+    : memberExpressionSource memberExpressionPath+ (recoveryTails)?
+    ;
+
+memberExpressionSource
+    : variable
+    | param
+    | arrayLiteral
+    | objectLiteral
+    | functionCall
+    | OpenParen (forExpression | waitForExpression | expression) CloseParen
+    ;
+
+functionCallExpression
+    : functionCall (errorOperator | recoveryTails)?
+    ;
+
+functionCallNoRecoveryExpression
+    : functionCall errorOperator?
+    ;
+
+functionCall
+    : namespace functionName OpenParen argumentList? CloseParen
+    ;
+
+functionName
+    : Identifier
+    | safeReservedWord
+    | unsafeReservedWord
+    ;
+
+argumentList
+    : expression (Comma expression)* Comma?
+    ;
+
+memberExpressionPath
+    : errorOperator? Dot propertyName
+    | (errorOperator Dot)? computedPropertyName
+    | (errorOperator Dot)? arrayExpansion
+    | arrayContraction
+    | arrayQuestionMark
+    | arrayApply
+    ;
+
+arrayExpansion
+    : OpenBracket star=Multi inlineExpression? CloseBracket
+    ;
+
+arrayContraction
+    : OpenBracket stars+=Multi stars+=Multi+ inlineExpression? CloseBracket
+    ;
+
+arrayQuestionMark
+    : OpenBracket QuestionMark (Filter {p.pushImplicitCurrent()} expression {p.popImplicitCurrent()} | arrayQuestionQuantifier Filter {p.pushImplicitCurrent()} expression {p.popImplicitCurrent()})? CloseBracket
+    ;
+
+arrayQuestionQuantifier
+    : Any
+    | All
+    | None
+    | At Least OpenParen arrayQuestionQuantifierValue CloseParen
+    | arrayQuestionQuantifierValue Range arrayQuestionQuantifierValue
+    | arrayQuestionQuantifierValue
+    ;
+
+arrayQuestionQuantifierValue
+    : integerLiteral
+    | param
+    ;
+
+arrayApply
+    : OpenBracket operator=(TildeQuestion | Tilde) queryLiteral CloseBracket
+    ;
+
+inlineExpression
+    : inlineFilter inlineLimit? inlineReturn?
+    | inlineLimit inlineReturn?
+    | inlineReturn
+    ;
+
+inlineFilter
+    : Filter {p.pushImplicitCurrent()} expression {p.popImplicitCurrent()}
+    ;
+
+inlineLimit
+    : Limit {p.pushImplicitCurrent()} limitClauseValue (Comma limitClauseValue)? {p.popImplicitCurrent()}
+    ;
+
+inlineReturn
+    : Return {p.pushImplicitCurrent()} expression {p.popImplicitCurrent()}
+    ;
+
+safeReservedWord
+    : And
+    | Or
+    | As
+    | Distinct
+    | Filter
+    | Sort
+    | Limit
+    | Collect
+    | Count
+    | SortDirection
+    | Into
+    | Keep
+    | With
+    | All
+    | Any
+    | At
+    | Least
+    | Aggregate
+    | Event
+    | Timeout
+    | Options
+    | Every
+    | Backoff
+    | Jitter
+    | Exists
+    | Value
+    | One
+    | Trigger
+    ;
+
+unsafeReservedWord
+    : Return
+    | Dispatch
+    | Delete
+    | Query
+    | Using
+    | None
+    | Null
+    | Let
+    | Var
+    | Use
+    | Waitfor
+    | While
+    | Do
+    | In
+    | Like
+    | Not
+    | For
+    | BooleanLiteral
+    | Match
+    | When
+    ;
+
+durationLiteral
+    : DurationLiteral
+    ;
+
+rangeOperator
+    : left=rangeOperand Range right=rangeOperand
+    ;
+
+rangeOperand
+    : integerLiteral
+    | variable
+    | param
+    | functionCallExpression
+    | implicitCurrentExpression
+    | {p.allowImplicitCurrent()}? implicitMemberExpression
+    | memberExpression
+    ;
+
+expression
+    : unaryOperator right=expression
+    | left=expression logicalAndOperator right=expression
+    | left=expression logicalOrOperator right=expression
+    | <assoc=right> left=expression coalesceOperator=Coalesce right=expression
+    | condition=expression ternaryOperator=QuestionMark onTrue=expression? Colon onFalse=expression
+    | predicate
+    ;
+
+predicate
+    : left=predicate equalityOperator right=predicate
+    | left=predicate arrayOperator right=predicate
+    | left=predicate inOperator right=predicate
+    | left=predicate likeOperator right=predicate
+    | expressionAtom
+    ;
+
+expressionAtom
+    : left=expressionAtom multiplicativeOperator right=expressionAtom
+    | left=expressionAtom additiveOperator right=expressionAtom
+    | left=expressionAtom regexpOperator right=expressionAtom
+    | matchExpression
+    | queryExpression
+    | memberExpression
+    | {p.GetTokenStream().LA(1) != FqlParserWaitfor && p.GetTokenStream().LA(1) != FqlParserDispatch}? functionCallExpression
+    | rangeOperator
+    | literal
+    | variable
+    | implicitCurrentExpression
+    | {p.allowImplicitCurrent()}? implicitMemberExpression
+    | param
+    | dispatchExpression
+    | waitForExpression
+    | OpenParen (forExpression | waitForExpression | expression) CloseParen (errorOperator | recoveryTails)?
+    ;
+
+matchExpression
+    : Match expression matchPatternArms
+    | Match matchGuardArms
+    ;
+
+matchPatternArms
+    : OpenBrace matchPatternArmList? matchDefaultArm Comma? CloseBrace
+    ;
+
+matchPatternArmList
+    : matchPatternArm (Comma matchPatternArm)* Comma
+    ;
+
+matchGuardArms
+    : OpenBrace matchGuardArmList? matchDefaultArm Comma? CloseBrace
+    ;
+
+matchGuardArmList
+    : matchGuardArm (Comma matchGuardArm)* Comma
+    ;
+
+matchPatternArm
+    : matchPattern matchPatternGuard? Arrow expression
+    ;
+
+matchPatternGuard
+    : When expression
+    ;
+
+matchGuardArm
+    : When expression Arrow expression
+    ;
+
+matchDefaultArm
+    : IgnoreIdentifier Arrow expression
+    ;
+
+matchPattern
+    : matchLiteralPattern
+    | matchBindingPattern
+    | matchObjectPattern
+    ;
+
+matchBindingPattern
+    : Identifier
+    | safeReservedWord
+    ;
+
+matchLiteralPattern
+    : noneLiteral
+    | booleanLiteral
+    | stringLiteral
+    | durationLiteral
+    | floatLiteral
+    | integerLiteral
+    ;
+
+matchObjectPattern
+    : OpenBrace (matchObjectPatternProperty (Comma matchObjectPatternProperty)* Comma?)? CloseBrace
+    ;
+
+matchObjectPatternProperty
+    : matchObjectPatternKey Colon matchPattern
+    ;
+
+matchObjectPatternKey
+    : Identifier
+    | stringLiteral
+    | safeReservedWord
+    | unsafeReservedWord
+    ;
+
+implicitMemberExpression
+    : implicitMemberExpressionStart memberExpressionPath*
+    ;
+
+implicitCurrentExpression
+    : {p.allowImplicitCurrent() && p.isImplicitCurrentValue()}? Dot
+    ;
+
+implicitMemberExpressionStart
+    : errorOperator? Dot propertyName
+    | errorOperator? Dot computedPropertyName
+    | Dot arrayExpansion
+    | Dot arrayContraction
+    | Dot arrayQuestionMark
+    | Dot arrayApply
+    ;
+
+queryExpression
+    : Query queryModifier queryPayload In expression (Using dialect=Identifier)? queryWithOpt? queryOptionsOpt? (recoveryTails)?
+    | Query {!p.isQueryModifierAhead()}? queryPayload In expression (Using dialect=Identifier)? queryWithOpt? queryOptionsOpt? (recoveryTails)?
+    ;
+
+queryModifier
+    : Exists
+    | Count
+    | One
+    ;
+
+queryPayload
+    : memberExpression
+    | literal
+    | functionCallExpression
+    | param
+    | variable
+    | OpenParen expression CloseParen
+    ;
+
+queryWithOpt
+    : With expression
+    ;
+
+queryOptionsOpt
+    : Options expression
+    ;
+
+queryLiteral
+    : Identifier (stringLiteral (OpenParen expression CloseParen)?)?
+    | stringLiteral
+    ;
+
+arrayOperator
+    : operator=(All | Any | None) (inOperator | equalityOperator)
+    ;
+
+equalityOperator
+    : Gt
+    | Lt
+    | Eq
+    | Gte
+    | Lte
+    | Neq
+    ;
+
+inOperator
+    : Not? In
+    ;
+
+likeOperator
+    : Not? Like
+    ;
+
+unaryOperator
+    : Not
+    | Plus
+    | Minus
+    ;
+
+regexpOperator
+    : RegexMatch
+    | RegexNotMatch
+    ;
+
+logicalAndOperator
+    : And
+    ;
+
+logicalOrOperator
+    : Or
+    ;
+
+multiplicativeOperator
+    : Multi
+    | Div
+    | Mod
+    ;
+
+additiveOperator
+    : Plus
+    | Minus
+    ;
+
+errorOperator
+    : QuestionMark
+    ;
+
+bindingPattern
+    : bindingIdentifier
+    | IgnoreIdentifier
+    | structuredBindingPattern
+    ;
+
+structuredBindingPattern
+    : objectBindingPattern
+    | arrayBindingPattern
+    ;
+
+objectBindingPattern
+    : OpenBrace (objectBindingEntry (Comma objectBindingEntry)* Comma?)? CloseBrace
+    ;
+
+objectBindingEntry
+    : bindingIdentifier (Colon bindingPattern)?
+    ;
+
+arrayBindingPattern
+    : OpenBracket (bindingPattern (Comma bindingPattern)* Comma?)? CloseBracket
+    ;

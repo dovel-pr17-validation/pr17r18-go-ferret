@@ -1,0 +1,170 @@
+package internal
+
+import (
+	"github.com/antlr4-go/antlr/v4"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/compiler/internal/core"
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+)
+
+// UDFCompiler compiles user-defined functions into bytecode.
+type UDFCompiler struct {
+	ctx   *CompilationSession
+	stmts *StatementCompiler
+}
+
+func NewUDFCompiler(ctx *CompilationSession) *UDFCompiler {
+	return &UDFCompiler{ctx: ctx}
+}
+
+func (c *UDFCompiler) bind(stmts *StatementCompiler) {
+	if c == nil {
+		return
+	}
+
+	c.stmts = stmts
+}
+
+func (c *UDFCompiler) CompileAll() {
+	if c == nil || c.ctx == nil || c.ctx.Program.UDFs == nil {
+		return
+	}
+
+	for _, fn := range c.ctx.Program.UDFs.Functions {
+		c.compile(fn)
+	}
+}
+
+func (c *UDFCompiler) compile(fn *core.UDFInfo) {
+	if c == nil || c.ctx == nil || fn == nil || fn.Decl == nil {
+		return
+	}
+
+	c.withFunctionCompileState(fn, func() {
+		fn.Entry = c.ctx.Program.Emitter.Size()
+		firstPoint := len(c.ctx.Program.DebugPoints)
+
+		c.ctx.Function.Symbols.EnterScope()
+		c.ctx.Function.FunctionID = fn.ID
+
+		for _, param := range fn.Params {
+			c.ctx.Function.Symbols.DeclareLocalWithOptions(param.Name, core.TypeAny, core.BindingOptions{
+				ID: param.ID,
+			})
+		}
+
+		for _, capture := range fn.Captures {
+			c.ctx.Function.Symbols.DeclareLocalWithOptions(capture.Name, core.TypeAny, core.BindingOptions{
+				ID:      capture.ID,
+				Mutable: capture.Mutable,
+				Storage: capture.Storage,
+				Hidden:  !capture.Visible,
+			})
+		}
+
+		body := fn.Decl.FunctionBody()
+		if body != nil {
+			if arrow := body.FunctionArrow(); arrow != nil {
+				c.compileExpressionReturn(arrow.Expression(), false)
+			} else if block := body.FunctionBlock(); block != nil {
+				for _, stmt := range block.AllFunctionStatement() {
+					c.stmts.CompileFunctionStatement(stmt)
+				}
+
+				if ret := block.FunctionReturn(); ret != nil {
+					c.compileReturn(ret)
+				} else {
+					c.stmts.emitImplicitNoneReturn()
+				}
+			}
+		}
+
+		if firstPoint < len(c.ctx.Program.DebugPoints) {
+			c.ctx.Program.DebugPoints[firstPoint].Kind = bytecode.DebugPointFunctionEntry
+		}
+
+		fn.Registers = c.ctx.Function.Registers.Size()
+	})
+}
+
+// withFunctionCompileState isolates function-local compiler state for a
+// single UDF body compilation.
+//
+// A fresh FunctionContext is created per UDF and carries no state from the
+// enclosing function: registers, symbol table, type tracker, loop table, and
+// UDFScope all start empty (UDFScope is wired to fn.BodyScope so inner UDF
+// name lookups walk the right chain). Anything that must survive the
+// function boundary - host params, host function refs, constants, UDF
+// metadata, emitter, catch table, errors - lives on ProgramContext and is
+// shared, so no copying across the boundary is required.
+//
+// The deferred restore guarantees the outer FunctionContext is reinstated on
+// every exit path, including panics.
+func (c *UDFCompiler) withFunctionCompileState(fn *core.UDFInfo, compile func()) {
+	if c == nil || c.ctx == nil || fn == nil || compile == nil {
+		return
+	}
+
+	outerFunction := c.ctx.Function
+
+	localFunction := NewFunctionContext(c.ctx.Program.Constants)
+	localFunction.UDFScope = fn.BodyScope
+	c.ctx.Function = localFunction
+	semanticScope := false
+
+	if c.ctx.Program.Semantics != nil {
+		semanticScope = c.ctx.Program.Semantics.PushUDFScope(fn)
+	}
+
+	defer func() {
+		if semanticScope {
+			c.ctx.Program.Semantics.ExitScope()
+		}
+
+		c.ctx.Function = outerFunction
+	}()
+
+	compile()
+}
+
+func (c *UDFCompiler) compileReturn(ctx fql.IFunctionReturnContext) {
+	if ctx == nil {
+		return
+	}
+
+	value := ctx.ReturnValue()
+	if value == nil {
+		return
+	}
+
+	if expr := value.Expression(); expr != nil {
+		c.compileExpressionReturn(expr, ctx.Distinct() != nil)
+
+		return
+	}
+
+	rule, _ := value.(antlr.ParserRuleContext)
+	c.ctx.WithDebugPointKind(rule, bytecode.DebugPointReturn, func() {
+		val := c.stmts.compileReturnOperand(value, ctx.Distinct() != nil)
+
+		c.ctx.Program.Emitter.EmitA(bytecode.OpReturn, val)
+	})
+}
+
+func (c *UDFCompiler) compileExpressionReturn(expr fql.IExpressionContext, distinct bool) {
+	if expr == nil {
+		return
+	}
+
+	rule, _ := expr.(antlr.ParserRuleContext)
+	c.ctx.WithDebugPointKind(rule, bytecode.DebugPointReturn, func() {
+		c.compileExpressionReturnInner(expr, distinct)
+	})
+}
+
+func (c *UDFCompiler) compileExpressionReturnInner(expr fql.IExpressionContext, distinct bool) {
+	val := c.stmts.CompileReturnValue(expr, distinct)
+
+	c.ctx.Program.Emitter.EmitA(bytecode.OpReturn, val)
+}

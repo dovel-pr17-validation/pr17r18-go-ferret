@@ -1,0 +1,91 @@
+package path_test
+
+import (
+	"context"
+	"testing"
+
+	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/path"
+)
+
+func TestMatch(t *testing.T) {
+	Convey("First argument is wrong", t, func() {
+		var err error
+		_, err = path.Match(context.Background(), runtime.NewInt(0), runtime.NewString("/"))
+
+		So(err, ShouldBeError)
+	})
+
+	Convey("Second argument is wrong", t, func() {
+		var err error
+		_, err = path.Match(context.Background(), runtime.NewString("/"), runtime.NewInt(0))
+
+		So(err, ShouldBeError)
+	})
+
+	Convey("Match('http://site.com/*.csv', 'http://site.com/goods.csv') should return true", t, func() {
+		out, _ := path.Match(
+			context.Background(),
+			runtime.NewString("http://site.com/*.csv"), runtime.NewString("http://site.com/goods.csv"),
+		)
+
+		So(out, ShouldEqual, runtime.True)
+	})
+
+	Convey("Match('ferret*/ferret', 'ferret/bin/ferret') should return false", t, func() {
+		out, _ := path.Match(
+			context.Background(),
+			runtime.NewString("ferret*/ferret"), runtime.NewString("ferret/bin/ferret"),
+		)
+
+		So(out, ShouldEqual, runtime.False)
+	})
+
+	Convey("Match('[x-]', 'x') should return ad error", t, func() {
+		_, err := path.Match(
+			context.Background(),
+			runtime.NewString("[x-]"), runtime.NewString("x"),
+		)
+
+		So(err, ShouldBeError)
+	})
+
+	Convey("Match('*.txt', 'file.txt') should return true", t, func() {
+		out, _ := path.Match(
+			context.Background(),
+			runtime.NewString("*.txt"), runtime.NewString("file.txt"),
+		)
+
+		So(out, ShouldEqual, runtime.True)
+	})
+
+	Convey("Match('*.txt', 'file.doc') should return false", t, func() {
+		out, _ := path.Match(
+			context.Background(),
+			runtime.NewString("*.txt"), runtime.NewString("file.doc"),
+		)
+
+		So(out, ShouldEqual, runtime.False)
+	})
+
+	Convey("Match('', '') should return true", t, func() {
+		out, _ := path.Match(
+			context.Background(),
+			runtime.NewString(""), runtime.NewString(""),
+		)
+
+		So(out, ShouldEqual, runtime.True)
+	})
+
+	Convey("Match('[abc]', 'b') should return true", t, func() {
+		out, _ := path.Match(
+			context.Background(),
+			runtime.NewString("[abc]"), runtime.NewString("b"),
+		)
+
+		So(out, ShouldEqual, runtime.True)
+	})
+}

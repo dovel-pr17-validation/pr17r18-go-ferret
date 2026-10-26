@@ -1,0 +1,30 @@
+package math_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/math"
+
+	. "github.com/smartystreets/goconvey/convey"
+)
+
+func TestFloor(t *testing.T) {
+	Convey("Should return a value", t, func() {
+		out, err := math.Floor(context.Background(), runtime.NewFloat(2.49))
+
+		So(err, ShouldBeNil)
+		So(out, ShouldEqual, 2)
+
+		out, err = math.Floor(context.Background(), runtime.NewFloat(2.50))
+
+		So(err, ShouldBeNil)
+		So(out, ShouldEqual, 2)
+
+		out, err = math.Floor(context.Background(), runtime.NewFloat(-2.50))
+
+		So(err, ShouldBeNil)
+		So(out, ShouldEqual, -3)
+	})
+}

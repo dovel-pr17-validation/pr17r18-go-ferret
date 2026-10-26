@@ -1,0 +1,191 @@
+package msgpack
+
+import (
+	"context"
+	"fmt"
+
+	vmmsgpack "github.com/vmihailenco/msgpack/v5"
+	"github.com/vmihailenco/msgpack/v5/msgpcode"
+
+	"github.com/MontFerret/ferret/v2/pkg/encoding"
+	"github.com/MontFerret/ferret/v2/pkg/encoding/internal/codecutil"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type decoder struct {
+	pre  []encoding.PreDecoderHook
+	post []encoding.PostDecoderHook
+}
+
+func (dec decoder) decodeValue(ctx context.Context, op *codecutil.Operation, d *vmmsgpack.Decoder) (runtime.Value, error) {
+	if err := op.Step(); err != nil {
+		return runtime.None, err
+	}
+
+	code, err := d.PeekCode()
+	if err != nil {
+		return runtime.None, err
+	}
+
+	switch {
+	case code == msgpcode.Nil:
+		if err := d.DecodeNil(); err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.None, nil
+	case code == msgpcode.False || code == msgpcode.True:
+		value, err := d.DecodeBool()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.NewBoolean(value), nil
+	case msgpcode.IsString(code):
+		value, err := d.DecodeString()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.NewString(value), nil
+	case msgpcode.IsBin(code):
+		value, err := d.DecodeBytes()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.NewBinary(value), nil
+	case code == msgpcode.Float || code == msgpcode.Double:
+		value, err := d.DecodeFloat64()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.NewFloat(value), nil
+	case isSignedIntCode(code):
+		value, err := d.DecodeInt64()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.Int(value), nil
+	case isUnsignedIntCode(code):
+		value, err := d.DecodeUint64()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return unsignedIntValue(value)
+	case isArrayCode(code):
+		return dec.decodeArray(ctx, op, d)
+	case isMapCode(code):
+		return dec.decodeMap(ctx, op, d)
+	case msgpcode.IsExt(code):
+		value, err := d.DecodeTime()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		return runtime.NewDateTime(value), nil
+	default:
+		return runtime.None, fmt.Errorf("msgpack: unsupported code %x", code)
+	}
+}
+
+func (dec decoder) decodeArray(ctx context.Context, op *codecutil.Operation, d *vmmsgpack.Decoder) (runtime.Value, error) {
+	size, err := d.DecodeArrayLen()
+	if err != nil {
+		return runtime.None, err
+	}
+
+	if size < 0 {
+		return runtime.None, nil
+	}
+
+	arr := runtime.NewArray(size)
+	for i := 0; i < size; i++ {
+		value, err := dec.decodeValue(ctx, op, d)
+		if err != nil {
+			return runtime.None, err
+		}
+
+		if err := arr.Append(ctx, value); err != nil {
+			return runtime.None, err
+		}
+	}
+
+	return arr, nil
+}
+
+func (dec decoder) decodeMap(ctx context.Context, op *codecutil.Operation, d *vmmsgpack.Decoder) (runtime.Value, error) {
+	size, err := d.DecodeMapLen()
+	if err != nil {
+		return runtime.None, err
+	}
+
+	if size < 0 {
+		return runtime.None, nil
+	}
+
+	obj := runtime.NewObjectOf(size)
+	for i := 0; i < size; i++ {
+		code, err := d.PeekCode()
+		if err != nil {
+			return runtime.None, err
+		}
+
+		var key string
+		if msgpcode.IsString(code) {
+			key, err = d.DecodeString()
+			if err != nil {
+				return runtime.None, err
+			}
+		} else {
+			keyValue, err := dec.decodeValue(ctx, op, d)
+			if err != nil {
+				return runtime.None, err
+			}
+
+			key = keyValue.String()
+		}
+
+		value, err := dec.decodeValue(ctx, op, d)
+		if err != nil {
+			return runtime.None, err
+		}
+
+		if err := obj.Set(ctx, runtime.NewString(key), value); err != nil {
+			return runtime.None, err
+		}
+	}
+
+	return obj, nil
+}
+
+func (dec decoder) runPreHooks(ctx context.Context) error {
+	if len(dec.pre) == 0 {
+		return nil
+	}
+
+	for _, hook := range dec.pre {
+		if err := hook(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (dec decoder) runPostHooks(ctx context.Context, value runtime.Value, err error) error {
+	if len(dec.post) == 0 {
+		return nil
+	}
+
+	for _, hook := range dec.post {
+		if hookErr := hook(ctx, value, err); hookErr != nil {
+			return hookErr
+		}
+	}
+
+	return nil
+}

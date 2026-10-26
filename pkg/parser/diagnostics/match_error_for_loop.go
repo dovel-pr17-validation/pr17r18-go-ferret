@@ -1,0 +1,264 @@
+package diagnostics
+
+import (
+	"strings"
+
+	"github.com/MontFerret/ferret/v2/pkg/diagnostics"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+)
+
+func matchForLoopErrors(src source.Source, err *diagnostics.Diagnostic, offending *TokenNode) bool {
+	prev := offending.Prev()
+
+	if eq := findPrevToken(offending, "=", 4); eq != nil && is(eq.Prev(), "COLLECT") {
+		span := spanFromTokenSafe(eq.Token(), src)
+		span.End = span.Start
+
+		err.Message = "Expected variable before '=' in COLLECT"
+		err.Hint = "COLLECT must group by a variable."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing variable"),
+		}
+
+		return true
+	}
+
+	if is(prev, "IN") {
+		span := insertionSpanAfterToken(prev.Token(), src)
+		err.Message = "Expected expression after 'IN'"
+		err.Hint = "Each FOR loop must iterate over a collection or range."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing value"),
+		}
+
+		return true
+	}
+
+	if is(prev, "FOR") {
+		span := insertionSpanAfterToken(offending.Token(), src)
+		err.Message = "Expected 'IN' after loop variable"
+		err.Hint = "Use 'FOR x IN [iterable]' syntax."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing keyword"),
+		}
+
+		return true
+	}
+
+	if is(offending, "FOR") {
+		span := insertionSpanAfterToken(offending.Token(), src)
+		if next := offending.Next(); is(next, "IN") {
+			span = spanFromTokenSafe(next.Token(), src)
+			span.End = span.Start
+		}
+
+		err.Message = "Expected loop variable before 'IN'"
+		err.Hint = "FOR must declare a variable."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing variable"),
+		}
+
+		return true
+	}
+
+	if is(offending, "COLLECT") {
+		msg := err.Message
+
+		if has(msg, "COLLECT =") {
+			span := insertionSpanAfterToken(offending.Token(), src)
+			if next := offending.Next(); is(next, "=") {
+				span = spanFromTokenSafe(next.Token(), src)
+				span.End = span.Start
+			}
+
+			err.Message = "Expected variable before '=' in COLLECT"
+			err.Hint = "COLLECT must group by a variable."
+			err.Spans = []diagnostics.ErrorSpan{
+				diagnostics.NewMainErrorSpan(span, "missing variable"),
+			}
+
+			return true
+		} else if isNoAlternative(msg) {
+			span := insertionSpanAfterToken(offending.Token(), src)
+
+			err.Message = "Incomplete COLLECT clause"
+			err.Hint = "COLLECT must specify a grouping key, an AGGREGATE clause, or WITH COUNT."
+			err.Spans = []diagnostics.ErrorSpan{
+				diagnostics.NewMainErrorSpan(span, "missing grouping or aggregation"),
+			}
+
+			return true
+		}
+	}
+
+	if is(offending, "INTO") {
+		span := insertionSpanAfterToken(offending.Token(), src)
+
+		err.Message = "Expected variable name after INTO"
+		err.Hint = "Provide a variable name to store grouped values, e.g. INTO groups."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing variable name"),
+		}
+
+		return true
+	}
+
+	if isNoAlternative(err.Message) && extractNoAlternativeInput(err.Message) == "INTO" {
+		if len(err.Spans) == 0 {
+			return false
+		}
+
+		span := err.Spans[0].Span
+		span.Start = span.End
+
+		err.Message = "Expected variable name after INTO"
+		err.Hint = "Provide a variable name to store grouped values, e.g. INTO groups."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing variable name"),
+		}
+
+		return true
+	}
+
+	if is(offending, "AGGREGATE") {
+		if isNoAlternative(err.Message) {
+			span := insertionSpanAfterToken(offending.Token(), src)
+
+			err.Message = "Expected variable assignment after AGGREGATE"
+			err.Hint = "Provide at least one variable assignment, e.g. AGGREGATE total = COUNT(x)."
+			err.Spans = []diagnostics.ErrorSpan{
+				diagnostics.NewMainErrorSpan(span, "missing variable assignment"),
+			}
+
+			return true
+		}
+	}
+
+	if is(prev, "FILTER") {
+		span := insertionSpanAfterToken(prev.Token(), src)
+
+		err.Message = "Incomplete FILTER clause"
+		err.Hint = "FILTER requires a boolean expression."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing expression"),
+		}
+
+		return true
+	}
+
+	if is(prev, "LIMIT") {
+		span := insertionSpanAfterToken(prev.Token(), src)
+
+		err.Message = "Expected number after 'LIMIT'"
+		err.Hint = "LIMIT requires a numeric value."
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing expression"),
+		}
+
+		return true
+	}
+
+	if isExtraneous(err.Message) {
+		input := extractExtraneousInput(err.Message)
+
+		if input != "," {
+			return false
+		}
+
+		if is(prev, "LIMIT") || diagnosticImmediatelyFollowsToken(src, err, "LIMIT") {
+			span := spanFromTokenSafe(offending.Token(), src)
+			if len(err.Spans) > 0 {
+				span = err.Spans[0].Span
+			}
+
+			span.Start = span.End
+
+			err.Message = "Dangling comma in LIMIT clause"
+			err.Hint = "LIMIT accepts one or two arguments. Did you forget to add a value?"
+			err.Spans = []diagnostics.ErrorSpan{
+				diagnostics.NewMainErrorSpan(span, "missing value"),
+			}
+
+			return true
+		}
+
+		var steps int
+
+		// We walk back two tokens to find if the keyword is LIMIT.
+		for ; steps < 2 && prev != nil; steps++ {
+			prev = prev.Prev()
+		}
+
+		if is(prev, "LIMIT") {
+			span := spanFromTokenSafe(offending.Token(), src)
+			if len(err.Spans) > 0 {
+				span = err.Spans[0].Span
+			}
+
+			err.Message = "Too many arguments provided to LIMIT clause"
+			err.Hint = "LIMIT accepts at most two arguments: offset and count."
+			err.Spans = []diagnostics.ErrorSpan{
+				diagnostics.NewMainErrorSpan(span, "unexpected third argument"),
+			}
+
+			return true
+		}
+	}
+
+	if isNoAlternative(err.Message) {
+		if is(prev, ",") {
+			var steps int
+
+			// We walk back two tokens to find if the keyword is LIMIT.
+			for ; steps < 2 && !is(prev, "LIMIT"); steps++ {
+				prev = prev.Prev()
+			}
+
+			if is(prev, "LIMIT") {
+				span := insertionSpanAfterToken(offending.Prev().Token(), src)
+
+				err.Message = "Dangling comma in LIMIT clause"
+				err.Hint = "LIMIT accepts one or two arguments. Did you forget to add a value?"
+				err.Spans = []diagnostics.ErrorSpan{
+					diagnostics.NewMainErrorSpan(span, "missing value"),
+				}
+
+				return true
+			}
+		} else if is(offending, "LIMIT") {
+			input := extractNoAlternativeInput(err.Message)
+			if input == "" {
+				return false
+			}
+			tokens := strings.Fields(input)
+
+			if len(tokens) > 0 && has(tokens[len(tokens)-1], ",") {
+				span := insertionSpanAfterToken(offending.Token(), src)
+
+				err.Message = "Dangling comma in LIMIT clause"
+				err.Hint = "LIMIT accepts one or two arguments. Did you forget to add a value?"
+				err.Spans = []diagnostics.ErrorSpan{
+					diagnostics.NewMainErrorSpan(span, "missing value"),
+				}
+
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func diagnosticImmediatelyFollowsToken(src source.Source, err *diagnostics.Diagnostic, expected string) bool {
+	if src.Empty() || err == nil {
+		return false
+	}
+
+	tokens := lexDefaultTokens(src.Content())
+	idx := findDiagnosticSpanTokenIndex(tokens, err)
+	if idx <= 0 {
+		return false
+	}
+
+	return tokenText(tokens[idx-1]) == expected
+}

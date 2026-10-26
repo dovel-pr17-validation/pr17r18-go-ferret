@@ -1,0 +1,36 @@
+package optimization_test
+
+import (
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/compiler"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/test/spec"
+	"github.com/MontFerret/ferret/v2/test/spec/compile"
+	. "github.com/MontFerret/ferret/v2/test/spec/optimize"
+)
+
+func TestConstantPropagationBasic(t *testing.T) {
+	RunUseCases(t, compiler.Basic, []spec.Spec{
+		OpcodeNotExists(`LET a = 1 + 2 RETURN a`, []bytecode.Opcode{bytecode.OpAdd}, 3, "Basic folds constant addition"),
+	})
+}
+
+func TestConstantPropagationFull(t *testing.T) {
+	RunUseCases(t, compiler.Full, []spec.Spec{
+		OpcodeNotExists(`LET a = 1 + 2 RETURN a`, []bytecode.Opcode{bytecode.OpAdd}, 3, "should fold constant addition"),
+
+		OpcodeNotExists(`LET a = 1 + 2 RETURN -a`, []bytecode.Opcode{bytecode.OpAdd, bytecode.OpFlipNegative}, -3, "should fold constant addition and unary minus"),
+
+		OpcodeNotExists(`LET a = 10 RETURN (a - 3) * 2`, []bytecode.Opcode{bytecode.OpSub, bytecode.OpMul}, 14, "should fold chain of arithmetic operations"),
+
+		OpcodeErr(`RETURN 1 / 0`, compile.OpcodeExistence{
+			Exists: []bytecode.Opcode{bytecode.OpDiv},
+		}, runtime.ErrInvalidOperation, "should not fold division by zero"),
+
+		OpcodeErr(`RETURN 1 / "0"`, compile.OpcodeExistence{
+			Exists: []bytecode.Opcode{bytecode.OpDiv},
+		}, runtime.ErrInvalidOperation, "should not fold division by zero with string"),
+	})
+}

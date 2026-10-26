@@ -1,0 +1,171 @@
+package data
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/internal/valueset"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type DataSet struct {
+	values     runtime.List
+	uniqueness *valueset.Set
+}
+
+func (*DataSet) VMUntracked() {}
+
+func NewDataSet(distinct bool) runtime.List {
+	var uniqueness *valueset.Set
+
+	if distinct {
+		uniqueness = valueset.New(0)
+	}
+
+	return &DataSet{
+		uniqueness: uniqueness,
+		values:     runtime.NewArray(16),
+	}
+}
+
+func (ds *DataSet) Append(ctx context.Context, item runtime.Value) error {
+	can, err := ds.canAdd(ctx, item)
+
+	if err != nil {
+		return err
+	}
+
+	if can {
+		if err := ds.values.Append(ctx, item); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (ds *DataSet) At(ctx context.Context, idx runtime.Int) (runtime.Value, error) {
+	return ds.values.At(ctx, idx)
+}
+
+func (ds *DataSet) LookupAt(ctx context.Context, index runtime.Int) (runtime.Value, bool, error) {
+	return ds.values.LookupAt(ctx, index)
+}
+
+func (ds *DataSet) Iterate(ctx context.Context) (runtime.Iterator, error) {
+	return ds.values.Iterate(ctx)
+}
+
+func (ds *DataSet) Length(ctx context.Context) (runtime.Int, error) {
+	return ds.values.Length(ctx)
+}
+
+func (ds *DataSet) String() string {
+	return "[DataSet]"
+}
+
+func (ds *DataSet) Hash() uint64 {
+	return ds.values.Hash()
+}
+
+func (ds *DataSet) Copy() runtime.Value {
+	return ds
+}
+
+func (ds *DataSet) Equal(ctx context.Context, other runtime.Value) (bool, error) {
+	equal, err := runtime.EqualValues(ctx, ds.values, other)
+
+	return bool(equal), err
+}
+
+func (ds *DataSet) Compare(ctx context.Context, other runtime.Value) (runtime.Ordering, error) {
+	return runtime.CompareValues(ctx, ds.values, other)
+}
+
+func (ds *DataSet) Clone(ctx context.Context) (runtime.Cloneable, error) {
+	return ds.values.Clone(ctx)
+}
+
+func (ds *DataSet) Clear(ctx context.Context) error {
+	return ds.values.Clear(ctx)
+}
+
+func (ds *DataSet) SetAt(ctx context.Context, idx runtime.Int, value runtime.Value) error {
+	return ds.values.SetAt(ctx, idx, value)
+}
+
+func (ds *DataSet) Remove(ctx context.Context, value runtime.Value) error {
+	return ds.values.Remove(ctx, value)
+}
+
+func (ds *DataSet) RemoveAt(ctx context.Context, idx runtime.Int) (runtime.Value, error) {
+	return ds.values.RemoveAt(ctx, idx)
+}
+
+func (ds *DataSet) Insert(ctx context.Context, idx runtime.Int, value runtime.Value) error {
+	return ds.values.Insert(ctx, idx, value)
+}
+
+func (ds *DataSet) Swap(ctx context.Context, a, b runtime.Int) error {
+	return ds.values.Swap(ctx, a, b)
+}
+
+func (ds *DataSet) Filter(ctx context.Context, predicate runtime.IndexReadablePredicate) (runtime.List, error) {
+	return ds.values.Filter(ctx, predicate)
+}
+
+func (ds *DataSet) Find(ctx context.Context, predicate runtime.IndexReadablePredicate) (runtime.Value, runtime.Boolean, error) {
+	return ds.values.Find(ctx, predicate)
+}
+
+func (ds *DataSet) IndexOf(ctx context.Context, value runtime.Value) (runtime.Int, error) {
+	return ds.values.IndexOf(ctx, value)
+}
+
+func (ds *DataSet) First(ctx context.Context) (runtime.Value, error) {
+	return ds.values.First(ctx)
+}
+
+func (ds *DataSet) Last(ctx context.Context) (runtime.Value, error) {
+	return ds.values.Last(ctx)
+}
+
+func (ds *DataSet) Slice(ctx context.Context, start, end runtime.Int) (runtime.List, error) {
+	return ds.values.Slice(ctx, start, end)
+}
+
+func (ds *DataSet) ForEach(ctx context.Context, predicate runtime.IndexReadablePredicate) error {
+	return ds.values.ForEach(ctx, predicate)
+}
+
+func (ds *DataSet) Contains(ctx context.Context, value runtime.Value) (runtime.Boolean, error) {
+	return ds.values.Contains(ctx, value)
+}
+
+func (ds *DataSet) SortAsc(ctx context.Context) error {
+	return ds.values.SortAsc(ctx)
+}
+
+func (ds *DataSet) SortDesc(ctx context.Context) error {
+	return ds.values.SortDesc(ctx)
+}
+
+// New creates an independent empty collection with the receiver's configuration.
+func (ds *DataSet) New(ctx context.Context) (runtime.List, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return NewDataSet(ds.uniqueness != nil), nil
+}
+
+func (ds *DataSet) Concat(ctx context.Context, other runtime.List) error {
+	return ds.values.Concat(ctx, other)
+}
+
+func (ds *DataSet) canAdd(ctx context.Context, value runtime.Value) (bool, error) {
+	if ds.uniqueness == nil {
+		return true, nil
+	}
+
+	return ds.uniqueness.Add(ctx, value)
+}

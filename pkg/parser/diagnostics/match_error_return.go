@@ -1,0 +1,72 @@
+package diagnostics
+
+import (
+	"fmt"
+
+	"github.com/MontFerret/ferret/v2/pkg/diagnostics"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+)
+
+func matchMissingReturnDistinctValue(src source.Source, err *diagnostics.Diagnostic, offending *TokenNode) bool {
+	if offending == nil {
+		return false
+	}
+
+	// DISTINCT is a contextual RETURN modifier. Parentheses explicitly select
+	// the safe-reserved identifier interpretation instead.
+	distinct := anyIs(offending, offending.Prev(), "DISTINCT")
+	if distinct == nil || !is(distinct.Prev(), "RETURN") ||
+		(!is(offending, "DISTINCT") && !is(offending, "<EOF>") && !is(offending, ")")) {
+		return false
+	}
+
+	span := insertionSpanAfterToken(distinct.Token(), src)
+	err.Message = "Expected expression after 'RETURN DISTINCT'"
+	err.Hint = "RETURN DISTINCT treats DISTINCT as a modifier. To return an identifier named DISTINCT, wrap it in parentheses, e.g. RETURN (DISTINCT)."
+	err.Spans = []diagnostics.ErrorSpan{
+		diagnostics.NewMainErrorSpan(span, "missing return value"),
+	}
+
+	return true
+}
+
+func matchMissingReturnValue(src source.Source, err *diagnostics.Diagnostic, offending *TokenNode) bool {
+	// Prefer range-specific error when the parser trips on an incomplete range like "0.. RETURN".
+	if is(offending, "..") || is(offending.Prev(), "..") || hasRangeToken(err.Message) {
+		span := rangeEndInsertionSpan(src, err, offending)
+
+		start := ""
+		if is(offending, "..") && offending.Prev() != nil {
+			start = offending.Prev().GetText()
+		} else if is(offending.Prev(), "..") && offending.Prev().Prev() != nil {
+			start = offending.Prev().Prev().GetText()
+		} else {
+			start = extractRangeStart(err.Message)
+		}
+
+		err.Message = "Expected end value after '..' in range expression"
+		err.Hint = fmt.Sprintf("Provide an end value to complete the range, e.g. %s..10.", start)
+		err.Spans = []diagnostics.ErrorSpan{
+			diagnostics.NewMainErrorSpan(span, "missing value"),
+		}
+
+		return true
+	}
+
+	if !is(offending, "RETURN") {
+		return false
+	}
+
+	span := insertionSpanAfterToken(offending.Token(), src)
+	if next := offending.Next(); is(next, ")") {
+		span = spanFromTokenSafe(next.Token(), src)
+	}
+
+	err.Message = fmt.Sprintf("Expected expression after '%s'", offending)
+	err.Hint = "Did you forget to provide a value to return?"
+	err.Spans = []diagnostics.ErrorSpan{
+		diagnostics.NewMainErrorSpan(span, "missing return value"),
+	}
+
+	return true
+}

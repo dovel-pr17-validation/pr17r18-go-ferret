@@ -1,0 +1,755 @@
+package internal
+
+import (
+	"fmt"
+
+	"github.com/antlr4-go/antlr/v4"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/compiler/internal/core"
+	parserd "github.com/MontFerret/ferret/v2/pkg/parser/diagnostics"
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+)
+
+type BindingCompiler struct {
+	ctx                  *CompilationSession
+	exprs                *ExprCompiler
+	facts                *TypeFacts
+	promotedDeclarations map[antlr.ParserRuleContext]struct{}
+}
+
+func NewBindingCompiler(ctx *CompilationSession) *BindingCompiler {
+	return &BindingCompiler{
+		ctx:                  ctx,
+		promotedDeclarations: make(map[antlr.ParserRuleContext]struct{}),
+	}
+}
+
+func (c *BindingCompiler) bind(exprs *ExprCompiler, facts *TypeFacts) {
+	if c == nil {
+		return
+	}
+
+	c.exprs = exprs
+	c.facts = facts
+}
+
+// PromoteDeclaration marks a declaration that must be emitted as a cell-backed binding
+// because a nested scope writes through the captured variable.
+func (c *BindingCompiler) PromoteDeclaration(decl antlr.ParserRuleContext) {
+	if c == nil || decl == nil {
+		return
+	}
+
+	c.promotedDeclarations[decl] = struct{}{}
+}
+
+func (c *BindingCompiler) IsPromotedDeclaration(decl antlr.ParserRuleContext) bool {
+	if c == nil || decl == nil {
+		return false
+	}
+
+	_, ok := c.promotedDeclarations[decl]
+	return ok
+}
+
+func (c *BindingCompiler) CompileVariableDeclaration(ctx fql.IVariableDeclarationContext) bytecode.Operand {
+	if ctx == nil {
+		return bytecode.NoopOperand
+	}
+
+	pattern := ctx.StructuredBindingPattern()
+	if pattern != nil {
+		leaves := declarationBindingPatternLeaves(ctx)
+		if duplicate, first, ok := duplicateBindingPatternLeaf(leaves); ok {
+			c.ctx.Program.Errors.DuplicateDestructuringBinding(duplicate.Context, first.Context, duplicate.Name)
+
+			return bytecode.NoopOperand
+		}
+
+		return c.compileDestructuringDeclaration(ctx, pattern)
+	}
+
+	name := c.declarationName(ctx)
+	if name == "" {
+		name = core.IgnorePseudoVariable
+	}
+
+	decl := ctx.(antlr.ParserRuleContext)
+	mutable := c.isMutableDeclaration(ctx)
+	storage := c.declarationStorage(decl, mutable)
+	src := c.exprs.Compile(ctx.Expression())
+
+	if src == bytecode.NoopOperand {
+		return bytecode.NoopOperand
+	}
+
+	srcType := c.facts.OperandType(src)
+
+	if name == core.IgnorePseudoVariable {
+		return bytecode.NoopOperand
+	}
+
+	opts := core.BindingOptions{
+		ID:      bindingIDFromRule(decl),
+		Mutable: mutable,
+		Storage: storage,
+	}
+
+	if storage == core.BindingStorageCell {
+		src = ensureOperandRegister(c.ctx, c.facts, src)
+
+		dest, ok := c.declareBinding(name, srcType, opts)
+		if !ok {
+			c.ctx.Program.Errors.VariableNotUnique(decl, name)
+
+			return bytecode.NoopOperand
+		}
+
+		c.ctx.Program.Emitter.EmitMakeCell(dest, src)
+		c.ctx.Function.Types.Set(dest, core.TypeAny)
+
+		if c.ctx.Program.Semantics != nil {
+			c.recordVariableDeclaration(ctx, opts.ID, name, mutable, srcType)
+		}
+
+		return dest
+	}
+
+	if src.IsConstant() {
+		dest, ok := c.declareBinding(name, srcType, opts)
+		if !ok {
+			c.ctx.Program.Errors.VariableNotUnique(decl, name)
+
+			return bytecode.NoopOperand
+		}
+
+		c.ctx.Program.Emitter.EmitLoadConst(dest, src)
+		c.ctx.Function.Types.Set(dest, srcType)
+
+		if c.ctx.Program.Semantics != nil {
+			c.recordVariableDeclaration(ctx, opts.ID, name, mutable, srcType)
+		}
+
+		return dest
+	}
+
+	if !c.assignBinding(name, srcType, src, opts) {
+		c.ctx.Program.Errors.VariableNotUnique(decl, name)
+		return bytecode.NoopOperand
+	}
+
+	c.ctx.Function.Types.Set(src, srcType)
+
+	if c.ctx.Program.Semantics != nil {
+		c.recordVariableDeclaration(ctx, opts.ID, name, mutable, srcType)
+	}
+
+	return src
+}
+
+func (c *BindingCompiler) compileDestructuringDeclaration(
+	ctx fql.IVariableDeclarationContext,
+	pattern fql.IStructuredBindingPatternContext,
+) bytecode.Operand {
+	src := c.exprs.Compile(ctx.Expression())
+	if src == bytecode.NoopOperand {
+		return bytecode.NoopOperand
+	}
+
+	src = ensureOperandRegister(c.ctx, c.facts, src)
+	declaration := source.Span{}
+
+	if c.ctx.Program.Semantics != nil {
+		declaration = parserd.SpanFromRuleContext(ctx.(antlr.ParserRuleContext))
+	}
+
+	c.compileDestructuringPattern(
+		pattern,
+		src,
+		c.isMutableDeclaration(ctx),
+		SemanticSymbolBinding,
+		declaration,
+		declaration.End,
+	)
+
+	return src
+}
+
+func (c *BindingCompiler) compileDestructuringPattern(
+	pattern fql.IStructuredBindingPatternContext,
+	src bytecode.Operand,
+	mutable bool,
+	kind SemanticSymbolKind,
+	declaration source.Span,
+	activation int,
+) {
+	if pattern == nil {
+		return
+	}
+
+	if object := pattern.ObjectBindingPattern(); object != nil {
+		c.emitDestructuringAssertion(object.(antlr.ParserRuleContext), src, bytecode.DestructureModeObject)
+
+		for _, entry := range object.AllObjectBindingEntry() {
+			c.compileObjectDestructuringEntry(entry, src, mutable, kind, declaration, activation)
+		}
+
+		return
+	}
+
+	if array := pattern.ArrayBindingPattern(); array != nil {
+		c.emitDestructuringAssertion(array.(antlr.ParserRuleContext), src, bytecode.DestructureModeArray)
+
+		for index, child := range array.AllBindingPattern() {
+			c.compileArrayDestructuringEntry(child, src, index, mutable, kind, declaration, activation)
+		}
+	}
+}
+
+func (c *BindingCompiler) compileObjectDestructuringEntry(
+	entry fql.IObjectBindingEntryContext,
+	src bytecode.Operand,
+	mutable bool,
+	kind SemanticSymbolKind,
+	declaration source.Span,
+	activation int,
+) {
+	if entry == nil || entry.BindingIdentifier() == nil {
+		return
+	}
+
+	nested := entry.BindingPattern()
+	if nested != nil && !bindingPatternHasBindings(nested) {
+		return
+	}
+
+	key := textOfBindingIdentifier(entry.BindingIdentifier())
+	keyConst := c.ctx.Function.Symbols.AddConstant(runtime.String(key))
+	entryCtx := entry.(antlr.ParserRuleContext)
+
+	if nested == nil {
+		leafCtx := entry.BindingIdentifier().(antlr.ParserRuleContext)
+		c.compileDestructuringLeaf(key, leafCtx, mutable, kind, declaration, activation, func(dst bytecode.Operand) {
+			c.emitObjectDestructuringLoad(entryCtx, dst, src, keyConst)
+		})
+
+		return
+	}
+
+	if id := nested.BindingIdentifier(); id != nil {
+		leafCtx := id.(antlr.ParserRuleContext)
+		c.compileDestructuringLeaf(textOfBindingIdentifier(id), leafCtx, mutable, kind, declaration, activation, func(dst bytecode.Operand) {
+			c.emitObjectDestructuringLoad(entryCtx, dst, src, keyConst)
+		})
+
+		return
+	}
+
+	structured := nested.StructuredBindingPattern()
+	if structured == nil {
+		return
+	}
+
+	child := c.ctx.Function.Registers.Allocate()
+	c.emitObjectDestructuringLoad(entryCtx, child, src, keyConst)
+	c.compileDestructuringPattern(structured, child, mutable, kind, declaration, activation)
+}
+
+func (c *BindingCompiler) compileArrayDestructuringEntry(
+	pattern fql.IBindingPatternContext,
+	src bytecode.Operand,
+	index int,
+	mutable bool,
+	kind SemanticSymbolKind,
+	declaration source.Span,
+	activation int,
+) {
+	if !bindingPatternHasBindings(pattern) {
+		return
+	}
+
+	indexConst := c.ctx.Function.Symbols.AddConstant(runtime.Int(index))
+	patternCtx := pattern.(antlr.ParserRuleContext)
+
+	if id := pattern.BindingIdentifier(); id != nil {
+		leafCtx := id.(antlr.ParserRuleContext)
+		c.compileDestructuringLeaf(textOfBindingIdentifier(id), leafCtx, mutable, kind, declaration, activation, func(dst bytecode.Operand) {
+			c.emitArrayDestructuringLoad(patternCtx, dst, src, indexConst)
+		})
+
+		return
+	}
+
+	structured := pattern.StructuredBindingPattern()
+	if structured == nil {
+		return
+	}
+
+	child := c.ctx.Function.Registers.Allocate()
+	c.emitArrayDestructuringLoad(patternCtx, child, src, indexConst)
+	c.compileDestructuringPattern(structured, child, mutable, kind, declaration, activation)
+}
+
+func (c *BindingCompiler) compileDestructuringLeaf(
+	name string,
+	ctx antlr.ParserRuleContext,
+	mutable bool,
+	kind SemanticSymbolKind,
+	declaration source.Span,
+	activation int,
+	load func(dst bytecode.Operand),
+) bytecode.Operand {
+	target, ok := c.declareDestructuringLeaf(name, ctx, mutable)
+	if !ok {
+		return bytecode.NoopOperand
+	}
+
+	load(target.Load)
+	c.ctx.Function.Types.Set(target.Load, core.TypeAny)
+
+	if target.Storage == core.BindingStorageCell {
+		c.ctx.Program.Emitter.EmitMakeCell(target.Destination, target.Load)
+		c.ctx.Function.Types.Set(target.Destination, core.TypeAny)
+	}
+
+	if c.ctx.Program.Semantics != nil {
+		selection := parserd.SpanFromRuleContext(ctx)
+		c.ctx.Program.Semantics.RecordBinding(
+			bindingIDFromRule(ctx),
+			name,
+			kind,
+			declaration,
+			selection,
+			mutable,
+			core.TypeAny,
+			activation,
+			c.ctx.Program.Semantics.CurrentFunctionSymbol(),
+			0,
+		)
+	}
+
+	return target.Destination
+}
+
+func (c *BindingCompiler) declareDestructuringLeaf(
+	name string,
+	ctx antlr.ParserRuleContext,
+	mutable bool,
+) (destructuringBindingTarget, bool) {
+	storage := c.declarationStorage(ctx, mutable)
+	opts := core.BindingOptions{
+		ID:      bindingIDFromRule(ctx),
+		Mutable: mutable,
+		Storage: storage,
+	}
+
+	dest, ok := c.declareBinding(name, core.TypeAny, opts)
+	if !ok {
+		c.ctx.Program.Errors.VariableNotUnique(ctx, name)
+
+		return destructuringBindingTarget{}, false
+	}
+
+	target := destructuringBindingTarget{
+		Destination: dest,
+		Load:        dest,
+		Storage:     storage,
+	}
+
+	if storage == core.BindingStorageCell {
+		target.Load = c.ctx.Function.Registers.Allocate()
+	}
+
+	return target, true
+}
+
+func (c *BindingCompiler) emitDestructuringAssertion(
+	ctx antlr.ParserRuleContext,
+	src bytecode.Operand,
+	mode bytecode.DestructureMode,
+) {
+	c.ctx.Program.Emitter.WithSpan(parserd.SpanFromRuleContext(ctx), func() {
+		c.ctx.Program.Emitter.EmitAssertDestructure(src, mode)
+	})
+}
+
+func (c *BindingCompiler) emitObjectDestructuringLoad(
+	ctx antlr.ParserRuleContext,
+	dst bytecode.Operand,
+	src bytecode.Operand,
+	key bytecode.Operand,
+) {
+	c.ctx.Program.Emitter.WithSpan(parserd.SpanFromRuleContext(ctx), func() {
+		c.ctx.Program.Emitter.EmitABC(bytecode.OpLoadKeyOptionalConst, dst, src, key)
+	})
+}
+
+func (c *BindingCompiler) emitArrayDestructuringLoad(
+	ctx antlr.ParserRuleContext,
+	dst bytecode.Operand,
+	src bytecode.Operand,
+	index bytecode.Operand,
+) {
+	c.ctx.Program.Emitter.WithSpan(parserd.SpanFromRuleContext(ctx), func() {
+		c.ctx.Program.Emitter.EmitABC(bytecode.OpLoadIndexOptionalConst, dst, src, index)
+	})
+}
+
+func (c *BindingCompiler) CompileAssignmentStatement(ctx fql.IAssignmentStatementContext) bytecode.Operand {
+	if ctx == nil {
+		return bytecode.NoopOperand
+	}
+
+	stmt, ok := ctx.(*fql.AssignmentStatementContext)
+	if !ok || stmt == nil {
+		return bytecode.NoopOperand
+	}
+
+	target := stmt.AssignmentTarget()
+	if target == nil {
+		return bytecode.NoopOperand
+	}
+
+	assignment, ok := newAssignmentTarget(target)
+	if !ok {
+		c.reportInvalidAssignmentTarget(stmt)
+
+		return bytecode.NoopOperand
+	}
+
+	if assignment.Root == "" || assignment.Root == core.IgnorePseudoVariable {
+		c.reportInvalidAssignmentTarget(stmt)
+
+		return bytecode.NoopOperand
+	}
+
+	binding, found := c.ctx.Function.Symbols.ResolveBinding(assignment.Root)
+	if !found {
+		if c.reportFunctionAssignmentTarget(assignment) {
+			return bytecode.NoopOperand
+		}
+
+		reportVariableNotFound(c.ctx, assignment.RootTok, assignment.Root)
+
+		return bytecode.NoopOperand
+	}
+
+	if c.ctx.Program.Semantics != nil {
+		c.ctx.Program.Semantics.RecordBindingReference(binding.ID, parserd.SpanFromRuleContext(assignment.RootCtx))
+	}
+
+	if len(assignment.Segments) > 0 {
+		return c.compilePathAssignmentStatement(stmt, assignment, binding)
+	}
+
+	name := assignment.Root
+	if !binding.Mutable {
+		err := c.ctx.Program.Errors.Create(parserd.SemanticError, stmt, fmt.Sprintf("Variable '%s' cannot be reassigned", name))
+		err.Hint = "Declare it with VAR if you need to update it."
+		c.ctx.Program.Errors.Add(err)
+
+		return bytecode.NoopOperand
+	}
+
+	operator := assignmentOperatorText(stmt)
+	src := bytecode.NoopOperand
+
+	if operator == "=" {
+		src = c.exprs.Compile(stmt.Expression())
+	} else if !augmentedAssignmentKnownTypeAllowed(operator, binding.Type) {
+		c.reportInvalidAugmentedAssignment(stmt, operator)
+
+		return bytecode.NoopOperand
+	} else if operator == "+=" && binding.Type == core.TypeString {
+		left := c.snapshotBindingValue(binding)
+		parts := append([]concatOperandSegment{{operand: left}}, buildConcatOperandSegmentsFromExpression(c.exprs, stmt.Expression())...)
+		src = emitConcatOperandSegments(c.ctx, c.facts, parts)
+	} else {
+		op, ok := resolveArithmeticBinaryOperator(operator)
+		if !ok {
+			return bytecode.NoopOperand
+		}
+
+		left := c.snapshotBindingValue(binding)
+		right := c.exprs.Compile(stmt.Expression())
+		src = emitBinaryOperation(c.ctx, c.facts, stmt, op, left, right)
+	}
+
+	srcType := c.facts.OperandType(src)
+	publishedType := srcType
+
+	if c.ctx.Function.Loops.Depth() > 0 {
+		publishedType = core.JoinValueTypes(binding.Type, srcType)
+	}
+
+	binding.Type = publishedType
+	if c.ctx.Program.Semantics != nil {
+		c.ctx.Program.Semantics.UpdateBindingType(binding.ID, publishedType)
+	}
+
+	return c.storeBindingValue(binding, src, publishedType)
+}
+
+func (c *BindingCompiler) LoadBindingValue(binding *core.Variable) bytecode.Operand {
+	if c == nil || c.ctx == nil || binding == nil {
+		return bytecode.NoopOperand
+	}
+
+	if binding.Storage != core.BindingStorageCell {
+		return binding.Register
+	}
+
+	dst := c.ctx.Function.Registers.Allocate()
+	c.ctx.Program.Emitter.EmitLoadCell(dst, binding.Register)
+	c.ctx.Function.Types.Set(dst, binding.Type)
+
+	return dst
+}
+
+func (c *BindingCompiler) captureBindingForDeclaration(ctx fql.IVariableDeclarationContext) captureBindingInfo {
+	if ctx == nil {
+		return captureBindingInfo{}
+	}
+
+	decl := ctx.(antlr.ParserRuleContext)
+
+	return captureBindingInfo{
+		Name:    c.declarationName(ctx),
+		Mutable: c.isMutableDeclaration(ctx),
+		Decl:    decl,
+		ID:      bindingIDFromRule(decl),
+	}
+}
+
+func (c *BindingCompiler) captureBindingsForDestructuringDeclaration(ctx fql.IVariableDeclarationContext) []captureBindingInfo {
+	if ctx == nil || ctx.StructuredBindingPattern() == nil {
+		return nil
+	}
+
+	mutable := c.isMutableDeclaration(ctx)
+	leaves := declarationBindingPatternLeaves(ctx)
+	bindings := make([]captureBindingInfo, 0, len(leaves))
+
+	for _, leaf := range leaves {
+		bindings = append(bindings, captureBindingInfo{
+			Name:    leaf.Name,
+			Mutable: mutable,
+			Decl:    leaf.Declaration,
+			ID:      leaf.ID,
+		})
+	}
+
+	return bindings
+}
+
+func (c *BindingCompiler) declarationName(ctx fql.IVariableDeclarationContext) string {
+	return bindingDeclarationName(ctx)
+}
+
+func (c *BindingCompiler) isMutableDeclaration(ctx fql.IVariableDeclarationContext) bool {
+	if ctx == nil {
+		return false
+	}
+
+	decl, ok := ctx.(*fql.VariableDeclarationContext)
+	return ok && decl.Var() != nil
+}
+
+func (c *BindingCompiler) recordVariableDeclaration(
+	ctx fql.IVariableDeclarationContext,
+	id core.BindingID,
+	name string,
+	mutable bool,
+	typ core.ValueType,
+) {
+	if c == nil || c.ctx == nil || c.ctx.Program.Semantics == nil || ctx == nil {
+		return
+	}
+
+	declaration := parserd.SpanFromRuleContext(ctx.(antlr.ParserRuleContext))
+	selection := declaration
+
+	if binding := ctx.BindingIdentifier(); binding != nil {
+		selection = parserd.SpanFromRuleContext(binding.(antlr.ParserRuleContext))
+	} else if identifier := ctx.Identifier(); identifier != nil {
+		selection = parserd.SpanFromToken(identifier.GetSymbol())
+	} else if reserved := ctx.SafeReservedWord(); reserved != nil {
+		selection = parserd.SpanFromRuleContext(reserved.(antlr.ParserRuleContext))
+	} else if token := ctx.GetId(); token != nil {
+		selection = parserd.SpanFromToken(token)
+	}
+
+	c.ctx.Program.Semantics.RecordBinding(
+		id,
+		name,
+		SemanticSymbolBinding,
+		declaration,
+		selection,
+		mutable,
+		typ,
+		declaration.End,
+		c.ctx.Program.Semantics.CurrentFunctionSymbol(),
+		0,
+	)
+}
+
+func (c *BindingCompiler) declarationStorage(decl antlr.ParserRuleContext, mutable bool) core.BindingStorage {
+	if decl == nil || !mutable {
+		return core.BindingStorageValue
+	}
+
+	if c.IsPromotedDeclaration(decl) {
+		return core.BindingStorageCell
+	}
+
+	return core.BindingStorageValue
+}
+
+func (c *BindingCompiler) declareBinding(
+	name string,
+	srcType core.ValueType,
+	opts core.BindingOptions,
+) (bytecode.Operand, bool) {
+	if c.ctx.Function.Symbols.Scope() == 0 {
+		return c.ctx.Function.Symbols.DeclareGlobalWithOptions(name, srcType, opts)
+	}
+
+	return c.ctx.Function.Symbols.DeclareLocalWithOptions(name, srcType, opts)
+}
+
+func (c *BindingCompiler) assignBinding(
+	name string,
+	srcType core.ValueType,
+	src bytecode.Operand,
+	opts core.BindingOptions,
+) bool {
+	if c.ctx.Function.Symbols.Scope() == 0 {
+		return c.ctx.Function.Symbols.AssignGlobalWithOptions(name, srcType, src, opts)
+	}
+
+	return c.ctx.Function.Symbols.AssignLocalWithOptions(name, srcType, src, opts)
+}
+
+func (c *BindingCompiler) snapshotBindingValue(binding *core.Variable) bytecode.Operand {
+	if c == nil || c.ctx == nil || binding == nil {
+		return bytecode.NoopOperand
+	}
+
+	if binding.Storage == core.BindingStorageCell {
+		return c.LoadBindingValue(binding)
+	}
+
+	snapshot := c.ctx.Function.Registers.Allocate()
+	c.facts.EmitMoveAuto(snapshot, binding.Register)
+
+	return snapshot
+}
+
+func (c *BindingCompiler) storeBindingValue(binding *core.Variable, src bytecode.Operand, publishedType core.ValueType) bytecode.Operand {
+	if c == nil || c.ctx == nil || binding == nil {
+		return bytecode.NoopOperand
+	}
+
+	if binding.Storage == core.BindingStorageCell {
+		src = ensureOperandRegister(c.ctx, c.facts, src)
+		c.ctx.Program.Emitter.EmitStoreCell(binding.Register, src)
+		return binding.Register
+	}
+
+	if src.IsConstant() {
+		c.ctx.Program.Emitter.EmitLoadConst(binding.Register, src)
+	} else {
+		c.facts.EmitMoveAuto(binding.Register, src)
+	}
+
+	c.ctx.Function.Types.Set(binding.Register, publishedType)
+
+	return binding.Register
+}
+
+func (c *BindingCompiler) reportInvalidAssignmentTarget(ctx antlr.ParserRuleContext) {
+	if ctx == nil {
+		return
+	}
+
+	err := c.ctx.Program.Errors.Create(parserd.SyntaxError, ctx, "Assignment target must be a binding or writable binding path")
+	err.Hint = "Use a declared binding name followed by member or index access."
+	c.ctx.Program.Errors.Add(err)
+}
+
+func (c *BindingCompiler) reportInvalidDeleteTarget(ctx antlr.ParserRuleContext) {
+	if ctx == nil {
+		return
+	}
+
+	err := c.ctx.Program.Errors.Create(parserd.SyntaxError, ctx, "DELETE requires a property or computed-key target")
+	err.Hint = `Use DELETE obj.foo or DELETE obj["foo"] to remove a property.`
+	c.ctx.Program.Errors.Add(err)
+}
+
+func (c *BindingCompiler) reportFunctionAssignmentTarget(target assignmentTarget) bool {
+	if c == nil || c.ctx == nil || c.ctx.Program.UDFs == nil || c.ctx.Function.UDFScope == nil {
+		return false
+	}
+
+	fn, found := c.ctx.Program.UDFs.ResolveDeclared(target.Root, c.ctx.Function.UDFScope)
+	if !found {
+		return false
+	}
+
+	name := fn.DisplayName
+	if name == "" {
+		name = target.Root
+	}
+
+	err := c.ctx.Program.Errors.Create(
+		parserd.SemanticError,
+		target.RootCtx,
+		fmt.Sprintf("Function '%s' cannot be used as an assignment target", name),
+	)
+	err.Spans[0].Label = "function is not a writable binding"
+	err.Hint = fmt.Sprintf("Call it as %s(...), or assign to a declared VAR binding instead.", name)
+	c.ctx.Program.Errors.Add(err)
+
+	return true
+}
+
+func (c *BindingCompiler) reportFunctionDeleteTarget(target assignmentTarget) bool {
+	if c == nil || c.ctx == nil || c.ctx.Program.UDFs == nil || c.ctx.Function.UDFScope == nil {
+		return false
+	}
+
+	fn, found := c.ctx.Program.UDFs.ResolveDeclared(target.Root, c.ctx.Function.UDFScope)
+	if !found {
+		return false
+	}
+
+	name := fn.DisplayName
+	if name == "" {
+		name = target.Root
+	}
+
+	err := c.ctx.Program.Errors.Create(
+		parserd.SemanticError,
+		target.RootCtx,
+		fmt.Sprintf("Function '%s' cannot be used as a delete target", name),
+	)
+	err.Spans[0].Label = "function is not a deletable binding"
+	err.Hint = fmt.Sprintf("Call it as %s(...), or delete a property from a declared binding instead.", name)
+	c.ctx.Program.Errors.Add(err)
+
+	return true
+}
+
+func (c *BindingCompiler) reportInvalidAugmentedAssignment(ctx antlr.ParserRuleContext, operator string) {
+	if ctx == nil {
+		return
+	}
+
+	err := c.ctx.Program.Errors.Create(parserd.SemanticError, ctx, fmt.Sprintf("Operator '%s' cannot be applied to this assignment target", operator))
+	err.Hint = "Use a numeric binding for arithmetic assignment, or a string binding with +=."
+	c.ctx.Program.Errors.Add(err)
+}

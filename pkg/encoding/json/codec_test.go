@@ -1,0 +1,964 @@
+package json_test
+
+import (
+	"context"
+	stdjson "encoding/json"
+	"errors"
+	"io"
+	"math"
+	"math/big"
+	"reflect"
+	"testing"
+	"time"
+
+	ferretencoding "github.com/MontFerret/ferret/v2/pkg/encoding"
+	"github.com/MontFerret/ferret/v2/pkg/encoding/json"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type iterOnly struct {
+	items []runtime.Value
+}
+
+type iterOnlyIter struct {
+	items []runtime.Value
+	idx   int
+}
+
+func (i *iterOnly) String() string {
+	return "iterable"
+}
+
+func (i *iterOnly) Hash() uint64 {
+	return 0
+}
+
+func (i *iterOnly) Copy() runtime.Value {
+	return i
+}
+
+func (i *iterOnly) Iterate(_ context.Context) (runtime.Iterator, error) {
+	return &iterOnlyIter{items: i.items}, nil
+}
+
+func (it *iterOnlyIter) Next(_ context.Context) (runtime.Value, runtime.Value, error) {
+	if it.idx >= len(it.items) {
+		return runtime.None, runtime.None, io.EOF
+	}
+
+	value := it.items[it.idx]
+	key := runtime.NewInt(it.idx)
+	it.idx++
+
+	return value, key, nil
+}
+
+type unwrapValue struct {
+	value any
+}
+
+func (u *unwrapValue) String() string {
+	return "unwrap"
+}
+
+func (u *unwrapValue) Hash() uint64 {
+	return 0
+}
+
+func (u *unwrapValue) Copy() runtime.Value {
+	return u
+}
+
+func (u *unwrapValue) Unwrap() any {
+	return u.value
+}
+
+type marshalerValue struct{}
+
+func (m *marshalerValue) String() string {
+	return "marshal"
+}
+
+func (m *marshalerValue) Hash() uint64 {
+	return 0
+}
+
+func (m *marshalerValue) Copy() runtime.Value {
+	return m
+}
+
+func (m *marshalerValue) MarshalJSON() ([]byte, error) {
+	return []byte(`{"custom":true}`), nil
+}
+
+type badValue struct {
+	Fn func()
+}
+
+func (b *badValue) String() string {
+	return "bad"
+}
+
+func (b *badValue) Hash() uint64 {
+	return 0
+}
+
+func (b *badValue) Copy() runtime.Value {
+	return b
+}
+
+func nestedArrayWithLeaf(depth int, leaf runtime.Value) runtime.Value {
+	value := leaf
+
+	for i := 0; i < depth; i++ {
+		value = runtime.NewArrayWith(value)
+	}
+
+	return value
+}
+
+func nestedArray(depth int) runtime.Value {
+	return nestedArrayWithLeaf(depth, runtime.NewInt(1))
+}
+
+func nestedObject(depth int) runtime.Value {
+	value := runtime.Value(runtime.NewInt(1))
+
+	for i := 0; i < depth; i++ {
+		value = runtime.NewObjectWith(map[string]runtime.Value{"x": value})
+	}
+
+	return value
+}
+
+func hookValueLabel(value runtime.Value) string {
+	switch v := value.(type) {
+	case nil:
+		return "<nil>"
+	case *badValue:
+		return "bad"
+	case runtime.Map:
+		return "map"
+	case runtime.List:
+		return "list"
+	case runtime.String:
+		return "string:" + string(v)
+	default:
+		return value.String()
+	}
+}
+
+func TestJSONCodecEncode(t *testing.T) {
+	codec := json.Default
+
+	assertJSON := func(t *testing.T, value runtime.Value, expected string) {
+		t.Helper()
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != expected {
+			t.Fatalf("expected %s, got %s", expected, string(out))
+		}
+	}
+
+	t.Run("none", func(t *testing.T) {
+		assertJSON(t, runtime.None, "null")
+	})
+
+	t.Run("boolean", func(t *testing.T) {
+		assertJSON(t, runtime.True, "true")
+		assertJSON(t, runtime.False, "false")
+	})
+
+	t.Run("string_no_escape", func(t *testing.T) {
+		assertJSON(t, runtime.NewString("<tag>"), "\"<tag>\"")
+	})
+
+	t.Run("int_matches_stdlib", func(t *testing.T) {
+		expected, err := stdjson.Marshal(42)
+		if err != nil {
+			t.Fatalf("std json marshal failed: %v", err)
+		}
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, runtime.NewInt(42))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != string(expected) {
+			t.Fatalf("expected %s, got %s", string(expected), string(out))
+		}
+	})
+
+	t.Run("float", func(t *testing.T) {
+		assertJSON(t, runtime.NewFloat(42.5), "42.5")
+	})
+
+	t.Run("duration", func(t *testing.T) {
+		assertJSON(t, runtime.NewDuration(1500*time.Millisecond), `"1.5s"`)
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte(`"1.5s"`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded != runtime.NewString("1.5s") {
+			t.Fatalf("decoded duration string = %v (%T)", decoded, decoded)
+		}
+	})
+
+	t.Run("regexp", func(t *testing.T) {
+		value, err := runtime.NewRegexp(`^<item>&[a-z]+>$`)
+		if err != nil {
+			t.Fatalf("compile regexp: %v", err)
+		}
+
+		assertJSON(t, value, `"^<item>&[a-z]+>$"`)
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte(`"^<item>&[a-z]+>$"`))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if decoded != runtime.NewString(`^<item>&[a-z]+>$`) {
+			t.Fatalf("decoded regexp string = %v (%T)", decoded, decoded)
+		}
+	})
+
+	t.Run("range", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			want  string
+			start runtime.Int
+			end   runtime.Int
+		}{
+			{name: "ascending", start: 1, end: 3, want: "[1,2,3]"},
+			{name: "descending", start: 3, end: 1, want: "[3,2,1]"},
+			{name: "negative ascending", start: -3, end: -1, want: "[-3,-2,-1]"},
+			{name: "negative descending", start: -1, end: -3, want: "[-1,-2,-3]"},
+			{name: "cross zero", start: -1, end: 1, want: "[-1,0,1]"},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				assertJSON(t, runtime.NewRange(test.start, test.end), test.want)
+			})
+		}
+	})
+
+	t.Run("range rejects overflow", func(t *testing.T) {
+		_, err := ferretencoding.EncodeBytes(t.Context(), codec, runtime.NewRange(math.MinInt64, -1))
+		if !errors.Is(err, runtime.ErrRange) {
+			t.Fatalf("encode error = %v, want ErrRange", err)
+		}
+	})
+
+	t.Run("binary", func(t *testing.T) {
+		data := []byte("hi")
+		expected, err := stdjson.Marshal(data)
+		if err != nil {
+			t.Fatalf("std json marshal failed: %v", err)
+		}
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, runtime.NewBinary(data))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != string(expected) {
+			t.Fatalf("expected %s, got %s", string(expected), string(out))
+		}
+	})
+
+	t.Run("datetime", func(t *testing.T) {
+		ts := time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC)
+		expected, err := stdjson.Marshal(ts)
+		if err != nil {
+			t.Fatalf("std json marshal failed: %v", err)
+		}
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, runtime.NewDateTime(ts))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != string(expected) {
+			t.Fatalf("expected %s, got %s", string(expected), string(out))
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		arr := runtime.NewArrayWith(runtime.NewInt(1), runtime.NewDuration(1500*time.Millisecond), runtime.True)
+		assertJSON(t, arr, "[1,\"1.5s\",true]")
+	})
+
+	t.Run("deeply_nested_array", func(t *testing.T) {
+		depth := 100_000
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, nestedArray(depth))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		expectedLen := depth*2 + 1
+		if len(out) != expectedLen {
+			t.Fatalf("expected output length %d, got %d", expectedLen, len(out))
+		}
+
+		if out[0] != '[' || out[len(out)-1] != ']' || out[depth] != '1' {
+			t.Fatalf("expected nested array encoding, got malformed output")
+		}
+	})
+
+	t.Run("object_json_equivalence_small", func(t *testing.T) {
+		obj := runtime.NewObjectWith(map[string]runtime.Value{
+			"b": runtime.NewInt(2),
+			"a": runtime.NewInt(1),
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, obj)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		var got map[string]any
+		if err := stdjson.Unmarshal(out, &got); err != nil {
+			t.Fatalf("std json unmarshal failed: %v", err)
+		}
+
+		expected := map[string]any{
+			"a": float64(1),
+			"b": float64(2),
+		}
+
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("expected %#v, got %#v", expected, got)
+		}
+	})
+
+	t.Run("deeply_nested_object", func(t *testing.T) {
+		depth := 40_000
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, nestedObject(depth))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		expectedLen := depth*6 + 1
+		if len(out) != expectedLen {
+			t.Fatalf("expected output length %d, got %d", expectedLen, len(out))
+		}
+
+		if out[0] != '{' || out[len(out)-1] != '}' || string(out[:5]) != "{\"x\":" {
+			t.Fatalf("expected nested object encoding, got malformed output")
+		}
+	})
+
+	t.Run("box", func(t *testing.T) {
+		assertJSON(t, runtime.NewBox(7), "7")
+	})
+
+	t.Run("iterable_branch", func(t *testing.T) {
+		iter := &iterOnly{items: []runtime.Value{runtime.NewInt(1), runtime.NewString("x")}}
+		assertJSON(t, iter, "[1,\"x\"]")
+	})
+
+	t.Run("unwrappable_branch", func(t *testing.T) {
+		value := &unwrapValue{value: map[string]any{"a": 1}}
+		expected, err := stdjson.Marshal(map[string]any{"a": 1})
+		if err != nil {
+			t.Fatalf("std json marshal failed: %v", err)
+		}
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != string(expected) {
+			t.Fatalf("expected %s, got %s", string(expected), string(out))
+		}
+	})
+
+	t.Run("json_marshaler_branch", func(t *testing.T) {
+		assertJSON(t, &marshalerValue{}, "{\"custom\":true}")
+	})
+
+	t.Run("object_json_equivalence", func(t *testing.T) {
+		obj := runtime.NewObjectWith(map[string]runtime.Value{
+			"a": runtime.NewInt(1),
+			"b": runtime.NewString("x"),
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, obj)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		var got map[string]any
+		if err := stdjson.Unmarshal(out, &got); err != nil {
+			t.Fatalf("std json unmarshal failed: %v", err)
+		}
+
+		expected := map[string]any{
+			"a": float64(1),
+			"b": "x",
+		}
+
+		if !reflect.DeepEqual(got, expected) {
+			t.Fatalf("expected %#v, got %#v", expected, got)
+		}
+	})
+}
+
+func TestJSONCodecEncodeHooks(t *testing.T) {
+	t.Run("hooks_run_in_order", func(t *testing.T) {
+		var order []string
+
+		config := json.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			if value != runtime.NewInt(7) {
+				t.Fatalf("expected hook value 7, got %v", value)
+			}
+
+			order = append(order, "pre1")
+
+			return nil
+		})
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			if value != runtime.NewInt(7) {
+				t.Fatalf("expected hook value 7, got %v", value)
+			}
+
+			order = append(order, "pre2")
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if value != runtime.NewInt(7) {
+				t.Fatalf("expected hook value 7, got %v", value)
+			}
+
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			order = append(order, "post")
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewInt(7))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != "7" {
+			t.Fatalf("expected 7, got %s", out)
+		}
+
+		expectedOrder := []string{"pre1", "pre2", "post"}
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("post_hooks_receive_encode_errors", func(t *testing.T) {
+		var postErr error
+
+		config := json.Default.EncodeWith()
+		config.PostHook(func(_ context.Context, _ runtime.Value, err error) error {
+			postErr = err
+
+			return nil
+		})
+
+		_, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), &badValue{Fn: func() {}})
+		if err == nil {
+			t.Fatal("expected encode error")
+		}
+
+		if postErr == nil {
+			t.Fatal("expected post hook to receive encode error")
+		}
+
+		if postErr.Error() != err.Error() {
+			t.Fatalf("expected post hook error %q, got %q", err, postErr)
+		}
+	})
+
+	t.Run("nested_hooks_run_depth_first", func(t *testing.T) {
+		var order []string
+
+		config := json.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			order = append(order, "pre:"+hookValueLabel(value))
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			order = append(order, "post:"+hookValueLabel(value))
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewObjectWith(map[string]runtime.Value{
+			"items": runtime.NewArrayWith(runtime.NewString("leaf")),
+		}))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != "{\"items\":[\"leaf\"]}" {
+			t.Fatalf("expected nested output, got %s", out)
+		}
+
+		expectedOrder := []string{
+			"pre:map",
+			"pre:list",
+			"pre:string:leaf",
+			"post:string:leaf",
+			"post:list",
+			"post:map",
+		}
+
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("range hooks run for items", func(t *testing.T) {
+		var order []string
+
+		config := json.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			order = append(order, "pre:"+hookValueLabel(value))
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			order = append(order, "post:"+hookValueLabel(value))
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewRange(1, 2))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if string(out) != "[1,2]" {
+			t.Fatalf("expected [1,2], got %s", out)
+		}
+
+		expectedOrder := []string{
+			"pre:1..2",
+			"pre:1",
+			"post:1",
+			"pre:2",
+			"post:2",
+			"post:1..2",
+		}
+
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("ancestor_post_hooks_receive_descendant_errors", func(t *testing.T) {
+		var postOrder []string
+		var postErrs []string
+
+		config := json.Default.EncodeWith()
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			postOrder = append(postOrder, hookValueLabel(value))
+
+			if err == nil {
+				postErrs = append(postErrs, "")
+			} else {
+				postErrs = append(postErrs, err.Error())
+			}
+
+			return nil
+		})
+
+		_, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewObjectWith(map[string]runtime.Value{
+			"items": runtime.NewArrayWith(&badValue{Fn: func() {}}),
+		}))
+		if err == nil {
+			t.Fatal("expected encode error")
+		}
+
+		expectedOrder := []string{"bad", "list", "map"}
+		if !reflect.DeepEqual(postOrder, expectedOrder) {
+			t.Fatalf("expected post hook order %#v, got %#v", expectedOrder, postOrder)
+		}
+
+		if len(postErrs) != len(expectedOrder) {
+			t.Fatalf("expected %d post hook errors, got %d", len(expectedOrder), len(postErrs))
+		}
+
+		for i, hookErr := range postErrs {
+			if hookErr != err.Error() {
+				t.Fatalf("expected hook %d to receive %q, got %q", i, err, hookErr)
+			}
+		}
+	})
+
+	t.Run("fallback_root_hooks_run_once", func(t *testing.T) {
+		special := &iterOnly{items: []runtime.Value{runtime.NewString("leaf")}}
+		value := nestedArrayWithLeaf(32_768, special)
+
+		preCalls := 0
+		postCalls := 0
+
+		config := json.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			if value == special {
+				preCalls++
+			}
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if value == special {
+				postCalls++
+			}
+
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if len(out) == 0 {
+			t.Fatal("expected encoded output")
+		}
+
+		if preCalls != 1 {
+			t.Fatalf("expected fallback root pre-hook once, got %d", preCalls)
+		}
+
+		if postCalls != 1 {
+			t.Fatalf("expected fallback root post-hook once, got %d", postCalls)
+		}
+	})
+
+	t.Run("configured_encoder_does_not_mutate_default", func(t *testing.T) {
+		calls := 0
+
+		config := json.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, _ runtime.Value) error {
+			calls++
+
+			return nil
+		})
+
+		if _, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewInt(1)); err != nil {
+			t.Fatalf("configured encode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected configured encoder to invoke hook once, got %d", calls)
+		}
+
+		if _, err := ferretencoding.EncodeBytes(t.Context(), json.Default, runtime.NewInt(2)); err != nil {
+			t.Fatalf("default encode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected default encoder to stay unmodified, got %d hook calls", calls)
+		}
+	})
+}
+
+func TestJSONCodecDecode(t *testing.T) {
+	codec := json.Default
+	ctx := context.Background()
+
+	t.Run("none", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("null"))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if value != runtime.None {
+			t.Fatalf("expected None, got %T", value)
+		}
+	})
+
+	t.Run("boolean", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("true"))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if value != runtime.True {
+			t.Fatalf("expected True, got %T", value)
+		}
+	})
+
+	t.Run("string", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte(`"hello"`))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if value != runtime.NewString("hello") {
+			t.Fatalf("expected hello, got %v", value)
+		}
+	})
+
+	t.Run("int", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("1"))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if _, ok := value.(runtime.Int); !ok {
+			t.Fatalf("expected Int, got %T", value)
+		}
+	})
+
+	t.Run("float", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("1.5"))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if _, ok := value.(runtime.Float); !ok {
+			t.Fatalf("expected Float, got %T", value)
+		}
+	})
+
+	t.Run("exponent", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("1e2"))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		f, ok := value.(runtime.Float)
+		if !ok {
+			t.Fatalf("expected Float, got %T", value)
+		}
+
+		if f != runtime.NewFloat(100) {
+			t.Fatalf("expected 100, got %v", f)
+		}
+	})
+
+	t.Run("overflow_int_fallback", func(t *testing.T) {
+		overflow := new(big.Int).SetInt64(math.MaxInt64)
+		overflow.Add(overflow, big.NewInt(1))
+
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte(overflow.String()))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if _, ok := value.(runtime.Float); !ok {
+			t.Fatalf("expected Float, got %T", value)
+		}
+	})
+
+	t.Run("nested", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte(`{"a":1,"b":[true,null,"x"]}`))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		obj, ok := value.(*runtime.Object)
+		if !ok {
+			t.Fatalf("expected Object, got %T", value)
+		}
+
+		a, err := obj.Get(ctx, runtime.NewString("a"))
+		if err != nil {
+			t.Fatalf("get a failed: %v", err)
+		}
+
+		if a != runtime.NewInt(1) {
+			t.Fatalf("expected 1, got %v", a)
+		}
+
+		b, err := obj.Get(ctx, runtime.NewString("b"))
+		if err != nil {
+			t.Fatalf("get b failed: %v", err)
+		}
+
+		arr, ok := b.(*runtime.Array)
+		if !ok {
+			t.Fatalf("expected Array, got %T", b)
+		}
+
+		item, err := arr.At(ctx, 0)
+		if err != nil {
+			t.Fatalf("array at 0 failed: %v", err)
+		}
+
+		if item != runtime.True {
+			t.Fatalf("expected true, got %v", item)
+		}
+
+		item, err = arr.At(ctx, 1)
+		if err != nil {
+			t.Fatalf("array at 1 failed: %v", err)
+		}
+
+		if item != runtime.None {
+			t.Fatalf("expected null, got %v", item)
+		}
+	})
+
+	t.Run("empty_input_error", func(t *testing.T) {
+		_, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte(""))
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("invalid_json_error", func(t *testing.T) {
+		_, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("{"))
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("multiple_roots_error", func(t *testing.T) {
+		_, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte("1 2"))
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+}
+
+func TestJSONCodecDecodeHooks(t *testing.T) {
+	t.Run("hooks_run_in_order", func(t *testing.T) {
+		input := []byte(`{"a":1}`)
+		var order []string
+
+		config := json.Default.DecodeWith()
+		config.PreHook(func(ctx context.Context) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			order = append(order, "pre1")
+
+			return nil
+		})
+		config.PreHook(func(ctx context.Context) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			order = append(order, "pre2")
+
+			return nil
+		})
+		config.PostHook(func(ctx context.Context, _ runtime.Value, err error) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			if err != nil {
+				t.Fatalf("expected successful decode, got %v", err)
+			}
+
+			order = append(order, "post")
+
+			return nil
+		})
+
+		value, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), input)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		expectedValue := runtime.NewObjectWith(map[string]runtime.Value{
+			"a": runtime.NewInt(1),
+		})
+
+		equal, err := runtime.EqualValues(t.Context(), value, expectedValue)
+		if err != nil || !equal {
+			t.Fatalf("expected decoded value %s, got %s", expectedValue, value)
+		}
+
+		expectedOrder := []string{"pre1", "pre2", "post"}
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("post_hooks_receive_decode_errors", func(t *testing.T) {
+		input := []byte("{")
+		var postErr error
+
+		config := json.Default.DecodeWith()
+		config.PostHook(func(ctx context.Context, _ runtime.Value, err error) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			postErr = err
+
+			return nil
+		})
+
+		_, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), input)
+		if err == nil {
+			t.Fatal("expected decode error")
+		}
+
+		if postErr == nil {
+			t.Fatal("expected post hook to receive decode error")
+		}
+
+		if postErr.Error() != err.Error() {
+			t.Fatalf("expected post hook error %q, got %q", err, postErr)
+		}
+	})
+
+	t.Run("configured_decoder_does_not_mutate_default", func(t *testing.T) {
+		calls := 0
+
+		config := json.Default.DecodeWith()
+		config.PreHook(func(_ context.Context) error {
+			calls++
+
+			return nil
+		})
+
+		if _, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), []byte("1")); err != nil {
+			t.Fatalf("configured decode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected configured decoder to invoke hook once, got %d", calls)
+		}
+
+		if _, err := ferretencoding.DecodeBytes(t.Context(), json.Default, []byte("1")); err != nil {
+			t.Fatalf("default decode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected default decoder to stay unmodified, got %d hook calls", calls)
+		}
+	})
+}

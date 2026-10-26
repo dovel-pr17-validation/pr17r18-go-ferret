@@ -1,0 +1,218 @@
+package internal
+
+import (
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/compiler/internal/core"
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// LoopSortCompiler handles compilation of SORT clauses within loops.
+// It transforms loop elements into KeyValuePairs where keys are sort expressions
+// and values are the original loop elements.
+type LoopSortCompiler struct {
+	ctx   *CompilationSession
+	exprs *ExprCompiler
+	facts *TypeFacts
+}
+
+func NewLoopSortCompiler(ctx *CompilationSession) *LoopSortCompiler {
+	return &LoopSortCompiler{ctx: ctx}
+}
+
+func (c *LoopSortCompiler) bind(exprs *ExprCompiler, facts *TypeFacts) {
+	if c == nil {
+		return
+	}
+
+	c.exprs = exprs
+	c.facts = facts
+}
+
+// Compile processes a SORT clause by:
+// 1. Extracting sort expressions and directions
+// 2. Creating KeyValuePairs for sorting
+// 3. Patching the loop with appropriate sorter operations
+// 4. Reinitializing the loop with sorted data
+func (c *LoopSortCompiler) Compile(ctx fql.ISortClauseContext) {
+	loop := c.ctx.Function.Loops.Current()
+	clauses := ctx.AllSortClauseExpression()
+
+	// Compile sort keys and get sort directions
+	kvKeyReg, directions := c.compileSortKeys(clauses)
+
+	// Handle the value part of KeyValuePair
+	kvValReg := c.resolveValueRegister(loop)
+
+	// Apply the appropriate sorter based on number of sort conditions
+	sorterReg := c.compileSorter(loop, clauses, directions)
+
+	// Emit the KeyValuePair and finalize the sorting process
+	c.finalizeSorting(loop, core.NewKV(kvKeyReg, kvValReg), sorterReg)
+}
+
+// compileSortKeys processes all sort expressions and returns the key register and directions.
+// For multiple expressions, it creates an array of keys; for single expression, uses the key directly.
+func (c *LoopSortCompiler) compileSortKeys(clauses []fql.ISortClauseExpressionContext) (bytecode.Operand, []runtime.SortDirection) {
+	kvKeyReg := c.ctx.Function.Registers.Allocate()
+	directions := make([]runtime.SortDirection, len(clauses))
+	isSortMany := len(clauses) > 1
+
+	if isSortMany {
+		return c.compileMultipleSortKeys(clauses, kvKeyReg, directions)
+	}
+
+	return c.compileSingleSortKey(clauses[0], kvKeyReg, directions)
+}
+
+// compileMultipleSortKeys handles compilation when there are multiple sort expressions.
+// It creates an array of compiled expressions for multi-key sorting.
+func (c *LoopSortCompiler) compileMultipleSortKeys(clauses []fql.ISortClauseExpressionContext, kvKeyReg bytecode.Operand, directions []runtime.SortDirection) (bytecode.Operand, []runtime.SortDirection) {
+	c.ctx.Program.Emitter.EmitArray(kvKeyReg, len(clauses))
+
+	// Compile each sort expression and store direction
+	for i, clause := range clauses {
+		clauseReg := c.exprs.Compile(clause.Expression())
+		c.ctx.Program.Emitter.EmitArrayPush(kvKeyReg, clauseReg)
+		directions[i] = sortDirection(clause.SortDirection())
+	}
+
+	return kvKeyReg, directions
+}
+
+// compileSingleSortKey handles compilation when there is only one sort expression.
+func (c *LoopSortCompiler) compileSingleSortKey(clause fql.ISortClauseExpressionContext, kvKeyReg bytecode.Operand, directions []runtime.SortDirection) (bytecode.Operand, []runtime.SortDirection) {
+	clauseReg := c.exprs.Compile(clause.Expression())
+	c.facts.EmitMoveAuto(kvKeyReg, clauseReg)
+	directions[0] = sortDirection(clause.SortDirection())
+
+	return kvKeyReg, directions
+}
+
+// resolveValueRegister determines the appropriate register for the value part of KeyValuePair.
+// If the loop already has a value name, reuse it; otherwise, allocate a new register
+// and load the value from the iterator.
+func (c *LoopSortCompiler) resolveValueRegister(loop *core.Loop) bytecode.Operand {
+	if loop.Kind == core.ForInLoop {
+		// If value is already used in the loop body, reuse the existing register
+		if loop.Value.IsRegister() {
+			return loop.Value
+		}
+
+		// Otherwise, allocate a new register and load the value from iterator
+		kvValReg := c.ctx.Function.Registers.Allocate()
+		loop.EmitValue(kvValReg, c.ctx.Program.Emitter)
+
+		return kvValReg
+	}
+
+	return loop.Key
+}
+
+// compileSorter configures a sorter for a loop based on provided sort clauses and directions.
+// It handles both single-key and multi-key sorting by emitting the appropriate VM operations.
+func (c *LoopSortCompiler) compileSorter(loop *core.Loop, clauses []fql.ISortClauseExpressionContext, directions []runtime.SortDirection) bytecode.Operand {
+	isSortMany := len(clauses) > 1
+
+	if isSortMany {
+		// Multi-key sorting requires encoded directions and count
+		encoded := runtime.EncodeSortDirections(directions)
+		count := len(clauses)
+
+		return loop.PatchDestinationAxy(c.ctx.Function.Registers, c.ctx.Program.Emitter, bytecode.OpDataSetMultiSorter, encoded, count)
+	}
+
+	// Single-key sorting only needs the direction
+	dir := sortDirection(clauses[0].SortDirection())
+
+	return loop.PatchDestinationAx(c.ctx.Function.Registers, c.ctx.Program.Emitter, bytecode.OpDataSetSorter, int(dir))
+}
+
+// finalizeSorting completes the sorting process by:
+// 1. Adding KeyValuePairs to the result dataset
+// 2. Finalizing the current loop
+// 3. Replacing the loop source with sorted results
+// 4. Reinitializing the loop for iteration over sorted data
+func (c *LoopSortCompiler) finalizeSorting(loop *core.Loop, kv *core.KV, sorter bytecode.Operand) {
+	// We need to pack the current scope before emitting the KeyValuePair
+	// In case the variables are used after SORT clause
+	// We need to restore them after the loop is reinitialized
+	scope := c.storeScope(kv)
+
+	// Add the KeyValuePair to the dataset
+	c.ctx.Program.Emitter.EmitABC(bytecode.OpPushKV, sorter, kv.Key, kv.Value)
+
+	// Finalize the current loop iteration
+	loop.EmitFinalization(c.ctx.Program.Emitter)
+
+	c.ctx.Function.Symbols.ExitScope()
+	c.ctx.Function.Symbols.EnterScope()
+
+	// Replace the loop source with sorted results
+	loop.LabelBase = c.ctx.Function.Loops.NextBase()
+	loop.Src = c.ctx.Function.Registers.Allocate()
+	c.ctx.Program.Emitter.EmitMoveTracked(loop.Src, sorter)
+
+	if loop.Kind != core.ForInLoop {
+		// We switched from a WhileLoop to a ForInLoop because the underlying data is Iterable now.
+		loop.Kind = core.ForInLoop
+	}
+
+	loop.Value = bytecode.NoopOperand
+	loop.Key = bytecode.NoopOperand
+
+	// Reinitialize the loop to iterate over sorted data
+	loop.EmitInitialization(c.ctx.Function.Registers, c.ctx.Program.Emitter)
+
+	// Unpack the scope to restore local variables
+	c.restoreScope(loop, scope)
+}
+
+// storeScope collects all local variables in the current scope, packs them into an array, and assigns it to the provided KV.
+func (c *LoopSortCompiler) storeScope(kv *core.KV) *core.ScopeProjection {
+	// No state to reset in this compiler
+	vars := c.ctx.Function.Symbols.ProjectionVariables()
+
+	if len(vars) == 0 {
+		return nil
+	}
+
+	sp := core.NewScopeProjection(c.ctx.Function.Registers, c.ctx.Program.Emitter, c.ctx.Function.Symbols, c.ctx.Function.Types, vars)
+	sp.EmitAsArray(kv.Value)
+
+	return sp
+}
+
+// restoreScope processes a loop's scope, declares key and value variables, and assigns them based on the scope array.
+func (c *LoopSortCompiler) restoreScope(loop *core.Loop, scope *core.ScopeProjection) {
+	// scope is not packed
+	if scope == nil {
+		if loop.KeyName != "" {
+			// TODO: Handle error if the key variable is not found
+			loop.DeclareKeyVar(loop.KeyName, c.ctx.Function.Symbols, core.TypeUnknown)
+		}
+
+		if loop.ValueName != "" {
+			// TODO: Handle error if the key variable is not found
+			loop.DeclareValueVar(loop.ValueName, c.ctx.Function.Symbols, core.TypeUnknown)
+		}
+
+		return
+	}
+
+	value := c.ctx.Function.Registers.Allocate()
+	c.ctx.Program.Emitter.EmitIterValue(value, loop.State)
+	scope.RestoreFromArray(value)
+
+	if loop.KeyName != "" {
+		found, _ := c.ctx.Function.Symbols.Lookup(loop.KeyName)
+		loop.Key = found.Register
+	}
+
+	if loop.ValueName != "" {
+		found, _ := c.ctx.Function.Symbols.Lookup(loop.ValueName)
+		loop.Value = found.Register
+	} else if loop.Destructured {
+		loop.Value = value
+	}
+}

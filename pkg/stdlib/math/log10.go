@@ -1,0 +1,19 @@
+package math
+
+import (
+	"context"
+	"math"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// log10 returns the decimal logarithm of a given value.
+// @param number {Int | Float} Input number.
+// @return {Float} The decimal logarithm of a given value.
+func Log10(_ context.Context, arg runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgValue(arg, 0, runtime.AssertNumber); err != nil {
+		return runtime.None, err
+	}
+
+	return runtime.NewFloat(math.Log10(toFloat(arg))), nil
+}

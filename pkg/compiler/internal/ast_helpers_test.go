@@ -1,0 +1,270 @@
+package internal
+
+import (
+	"context"
+	"errors"
+	"math"
+	"reflect"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+func TestCompileFirstOperand_Order(t *testing.T) {
+	order := make([]int, 0)
+
+	op := compileFirstOperand(
+		newOperandBranch(true, func() bytecode.Operand {
+			order = append(order, 1)
+			return bytecode.NoopOperand
+		}),
+		newOperandBranch(false, func() bytecode.Operand {
+			t.Fatal("disabled branch should not execute")
+			return bytecode.NoopOperand
+		}),
+		newOperandBranch(true, func() bytecode.Operand {
+			order = append(order, 2)
+			return bytecode.NewRegister(7)
+		}),
+		newOperandBranch(true, func() bytecode.Operand {
+			order = append(order, 3)
+			return bytecode.NewRegister(8)
+		}),
+	)
+
+	if op != bytecode.NewRegister(7) {
+		t.Fatalf("unexpected operand: got %s", op)
+	}
+
+	if !reflect.DeepEqual(order, []int{1, 2}) {
+		t.Fatalf("unexpected execution order: got %v", order)
+	}
+}
+
+func TestCompileFirstOperand_NoCandidate(t *testing.T) {
+	op := compileFirstOperand(
+		newOperandBranch(false, func() bytecode.Operand { return bytecode.NewRegister(1) }),
+		newOperandBranch(true, func() bytecode.Operand { return bytecode.NoopOperand }),
+	)
+
+	if op != bytecode.NoopOperand {
+		t.Fatalf("expected noop operand, got %s", op)
+	}
+}
+
+func TestLiteralBooleanValue(t *testing.T) {
+	val, ok := literalBooleanValue("true")
+	if !ok || val != runtime.True {
+		t.Fatalf("expected true literal, got (%v, %v)", val, ok)
+	}
+
+	val, ok = literalBooleanValue("FALSE")
+	if !ok || val != runtime.False {
+		t.Fatalf("expected false literal, got (%v, %v)", val, ok)
+	}
+
+	if _, ok = literalBooleanValue("invalid"); ok {
+		t.Fatal("expected invalid boolean literal to fail")
+	}
+}
+
+func TestLiteralNumericValue(t *testing.T) {
+	floatVal, ok := literalFloatValue("1.5")
+	if !ok {
+		t.Fatal("expected float literal to parse")
+	}
+
+	f, ok := floatVal.(runtime.Float)
+	if !ok || f != runtime.NewFloat(1.5) {
+		t.Fatalf("unexpected float literal result: %v", floatVal)
+	}
+
+	if _, ok = literalFloatValue("a"); ok {
+		t.Fatal("expected invalid float literal to fail")
+	}
+
+	intVal, ok := literalIntValue("42")
+	if !ok {
+		t.Fatal("expected int literal to parse")
+	}
+
+	i, ok := intVal.(runtime.Int)
+	if !ok || i != runtime.NewInt(42) {
+		t.Fatalf("unexpected int literal result: %v", intVal)
+	}
+
+	if _, ok = literalIntValue("x"); ok {
+		t.Fatal("expected invalid int literal to fail")
+	}
+}
+
+func TestLiteralIntValueBoundaries(t *testing.T) {
+	for _, input := range []int64{math.MinInt64, math.MinInt32 - 1, math.MaxInt32 + 1, 1<<53 + 1, math.MaxInt64} {
+		t.Run(strconv.FormatInt(input, 10), func(t *testing.T) {
+			value, ok := literalIntValue(strconv.FormatInt(input, 10))
+			if !ok || value != runtime.NewInt64(input) {
+				t.Fatalf("literal = %v (%T), valid = %v, want Int(%d)", value, value, ok, input)
+			}
+		})
+	}
+
+	for _, input := range []string{"9223372036854775808", "-9223372036854775809"} {
+		t.Run(input, func(t *testing.T) {
+			if value, ok := literalIntValue(input); ok {
+				t.Fatalf("out-of-range literal accepted: %v", value)
+			}
+		})
+	}
+}
+
+func TestResolveWaitPredicateMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		hasValue  bool
+		hasExists bool
+		hasNot    bool
+		expected  waitForPredicateMode
+	}{
+		{
+			name:      "value takes precedence",
+			hasValue:  true,
+			hasExists: true,
+			hasNot:    true,
+			expected:  waitForPredicateModeValue,
+		},
+		{
+			name:      "exists",
+			hasExists: true,
+			expected:  waitForPredicateModeExists,
+		},
+		{
+			name:      "not exists",
+			hasExists: true,
+			hasNot:    true,
+			expected:  waitForPredicateModeNotExists,
+		},
+		{
+			name:     "bool fallback",
+			expected: waitForPredicateModeBool,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mode := resolveWaitPredicateMode(tt.hasValue, tt.hasExists, tt.hasNot)
+			if mode != tt.expected {
+				t.Fatalf("unexpected mode: got %d want %d", mode, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseDurationLiteral_Valid(t *testing.T) {
+	tests := []struct {
+		expected runtime.Value
+		name     string
+		input    string
+	}{
+		{
+			name:     "milliseconds",
+			input:    "100ms",
+			expected: runtime.NewDuration(100 * time.Millisecond),
+		},
+		{
+			name:     "seconds",
+			input:    "2s",
+			expected: runtime.NewDuration(2 * time.Second),
+		},
+		{
+			name:     "minutes",
+			input:    "1.5m",
+			expected: runtime.NewDuration(90 * time.Second),
+		},
+		{
+			name:     "hours with spaces",
+			input:    " 1h ",
+			expected: runtime.NewDuration(time.Hour),
+		},
+		{
+			name:     "fractional milliseconds",
+			input:    "0.5ms",
+			expected: runtime.NewDuration(500 * time.Microsecond),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := parseDurationLiteral(tt.input)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			equal, err := runtime.EqualValues(context.Background(), actual, tt.expected)
+			if err != nil {
+				t.Fatalf("compare duration: %v", err)
+			}
+			if !equal {
+				t.Fatalf("unexpected value: got %v want %v", actual, tt.expected)
+			}
+
+			if _, ok := actual.(runtime.Duration); !ok {
+				t.Fatalf("unexpected value kind: %T", actual)
+			}
+		})
+	}
+}
+
+func TestParseDurationLiteral_Invalid(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "empty",
+			input: "",
+		},
+		{
+			name:  "missing unit",
+			input: "100",
+		},
+		{
+			name:  "missing numeric part",
+			input: "ms",
+		},
+		{
+			name:  "unknown unit",
+			input: "1x",
+		},
+		{
+			name:  "invalid number",
+			input: "abcs",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := parseDurationLiteral(tt.input)
+			if err == nil {
+				t.Fatal("expected parsing error")
+			}
+
+			if actual != runtime.ZeroDuration {
+				t.Fatalf("expected zero duration on error, got %v", actual)
+			}
+		})
+	}
+}
+
+func TestParseDurationLiteral_OutOfRange(t *testing.T) {
+	actual, err := parseDurationLiteral("1e20ms")
+	if !errors.Is(err, runtime.ErrRange) {
+		t.Fatalf("expected range error, got %v", err)
+	}
+
+	if actual != runtime.ZeroDuration {
+		t.Fatalf("expected zero duration on error, got %v", actual)
+	}
+}

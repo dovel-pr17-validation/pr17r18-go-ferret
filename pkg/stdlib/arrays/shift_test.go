@@ -1,0 +1,36 @@
+package arrays_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+
+	. "github.com/smartystreets/goconvey/convey"
+)
+
+func TestShift(t *testing.T) {
+	Convey("Should return a copy of an array without the first element", t, func() {
+		arr := runtime.NewArrayWith(
+			runtime.NewInt(1),
+			runtime.NewInt(2),
+			runtime.NewInt(3),
+			runtime.NewInt(4),
+			runtime.NewInt(5),
+		)
+
+		out, err := callLegacy("shift", context.Background(), arr)
+
+		So(err, ShouldBeNil)
+		So(out.String(), ShouldEqual, "[2,3,4,5]")
+	})
+
+	Convey("Should return empty array if a given one is empty", t, func() {
+		arr := runtime.NewArray(0)
+
+		out, err := callLegacy("shift", context.Background(), arr)
+
+		So(err, ShouldBeNil)
+		So(out.String(), ShouldEqual, "[]")
+	})
+}

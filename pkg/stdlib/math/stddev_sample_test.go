@@ -1,0 +1,30 @@
+package math_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/math"
+
+	. "github.com/smartystreets/goconvey/convey"
+)
+
+func TestStandardDeviationSample(t *testing.T) {
+	Convey("Should return a value", t, func() {
+		out, err := math.StandardDeviationSample(
+			context.Background(),
+			runtime.NewArrayWith(
+				runtime.NewInt(1),
+				runtime.NewInt(3),
+				runtime.NewInt(6),
+				runtime.NewInt(5),
+				runtime.NewInt(2),
+			),
+		)
+
+		So(err, ShouldBeNil)
+		assertMathResult(t, out, runtime.Float(2.073644135332772))
+	})
+}

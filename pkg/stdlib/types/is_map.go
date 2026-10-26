@@ -1,0 +1,14 @@
+package types
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// is_map checks whether value is a map value.
+// @param value {Any} Input value of arbitrary type.
+// @return {Boolean} Returns true if value is map, otherwise false.
+func IsMap(_ context.Context, arg runtime.Value) (runtime.Value, error) {
+	return isTypeof(arg, runtime.TypeMap), nil
+}

@@ -1,0 +1,100 @@
+package encoding_test
+
+import (
+	"context"
+	"testing"
+
+	. "github.com/smartystreets/goconvey/convey"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/encoding"
+)
+
+func TestBase64Decode(t *testing.T) {
+	Convey("When hash is not valid base64", t, func() {
+		Convey("It should return an error", func() {
+			var err error
+			_, err = encoding.Base64Decode(
+				context.Background(),
+				runtime.NewString("foobar"),
+			)
+
+			So(err, ShouldBeError)
+		})
+	})
+
+	Convey("Should decode a given hash", t, func() {
+		out, err := encoding.Base64Decode(
+			context.Background(),
+			runtime.NewString("Zm9vYmFy"),
+		)
+
+		So(err, ShouldBeNil)
+		So(out, ShouldNotEqual, "Zm9vYmFy")
+		So(out.String(), ShouldEqual, "foobar")
+	})
+}
+
+func TestQueryUnescape(t *testing.T) {
+	Convey("When invalid URI encoding", t, func() {
+		Convey("It should return an error", func() {
+			_, err := encoding.QueryUnescape(
+				context.Background(),
+				runtime.NewString("invalid%uri%encoding%"),
+			)
+
+			So(err, ShouldBeError)
+		})
+	})
+
+	Convey("Decode", t, func() {
+		testCases := []struct {
+			Name   string
+			InURI  string
+			OutURI string
+		}{
+			{
+				Name:   "Literal Unicode escape",
+				InURI:  `https://thedomain/alphabet=M\u0026borough=Bronx`,
+				OutURI: `https://thedomain/alphabet=M\u0026borough=Bronx`,
+			},
+			{
+				Name:   "Percent-encoding",
+				InURI:  "https://ru.wikipedia.org/wiki/%D0%AF%D0%B7%D1%8B%D0%BA_%D0%BF%D1%80%D0%BE%D0%B3%D1%80%D0%B0%D0%BC%D0%BC%D0%B8%D1%80%D0%BE%D0%B2%D0%B0%D0%BD%D0%B8%D1%8F",
+				OutURI: "https://ru.wikipedia.org/wiki/Язык_программирования",
+			},
+			{
+				Name:   "Double quote",
+				InURI:  "%22quoted%22",
+				OutURI: `"quoted"`,
+			},
+			{
+				Name:   "Apostrophe",
+				InURI:  "can%27t",
+				OutURI: "can't",
+			},
+			{
+				Name:   "Backslash",
+				InURI:  `%5Cpath%5Cto%5Cvalue`,
+				OutURI: `\path\to\value`,
+			},
+			{
+				Name:   "Newline",
+				InURI:  "line%0Abreak",
+				OutURI: "line\nbreak",
+			},
+		}
+
+		for _, tC := range testCases {
+			Convey(tC.Name, func() {
+				out, err := encoding.QueryUnescape(
+					context.Background(),
+					runtime.NewString(tC.InURI),
+				)
+				So(err, ShouldBeNil)
+
+				So(out.String(), ShouldEqual, tC.OutURI)
+			})
+		}
+	})
+}

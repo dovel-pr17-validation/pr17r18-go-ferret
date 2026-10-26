@@ -1,0 +1,408 @@
+package core
+
+import (
+	"sort"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+const (
+	jumpPlaceholder      = -1
+	UndefinedVariable    = -1
+	IgnorePseudoVariable = "_"
+	PseudoVariable       = "__CURRENT__"
+)
+
+type (
+	SymbolKind int
+
+	ValueType int
+
+	BindingStorage int
+
+	// BindingID identifies a source declaration within one compilation.
+	BindingID int
+
+	BindingOptions struct {
+		ID      BindingID
+		Storage BindingStorage
+		Mutable bool
+		Hidden  bool
+	}
+)
+
+// InvalidBindingID represents a binding without source identity.
+const InvalidBindingID BindingID = 0
+
+const (
+	SymbolConst SymbolKind = iota
+	SymbolGlobal
+	SymbolLocal
+	SymbolParam
+)
+
+const (
+	BindingStorageValue BindingStorage = iota
+	BindingStorageCell
+)
+
+const (
+	TypeUnknown ValueType = iota
+	TypeNone
+	TypeInt
+	TypeFloat
+	TypeDuration
+	TypeString
+	TypeBool
+	TypeArray
+	TypeObject
+	TypeList
+	TypeMap
+	TypeAny
+)
+
+// IsScalar reports whether the type is a known scalar.
+func (t ValueType) IsScalar() bool {
+	switch t {
+	case TypeNone, TypeInt, TypeFloat, TypeDuration, TypeString, TypeBool:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsUntracked reports whether the type is known to never carry direct resource
+// / closer ownership at runtime.
+func (t ValueType) IsUntracked() bool {
+	switch t {
+	case TypeNone, TypeInt, TypeFloat, TypeDuration, TypeString, TypeBool, TypeArray, TypeObject:
+		return true
+	default:
+		return false
+	}
+}
+
+type (
+	Variable struct {
+		Name     string
+		ID       BindingID
+		Kind     SymbolKind
+		Register bytecode.Operand
+		Depth    int
+		Type     ValueType
+		Storage  BindingStorage
+		Mutable  bool
+		Hidden   bool
+	}
+
+	SymbolTable struct {
+		registers *RegisterAllocator
+		constants *ConstantPool
+
+		globals map[string]*Variable
+		locals  []*Variable
+
+		scope int
+	}
+)
+
+func NewSymbolTable(registers *RegisterAllocator, constants *ConstantPool) *SymbolTable {
+	if constants == nil {
+		constants = NewConstantPool()
+	}
+
+	return &SymbolTable{
+		registers: registers,
+		constants: constants,
+		globals:   make(map[string]*Variable),
+		locals:    make([]*Variable, 0),
+	}
+}
+
+func (st *SymbolTable) Scope() int {
+	return st.scope
+}
+
+func (st *SymbolTable) EnterScope() {
+	st.scope++
+}
+
+func (st *SymbolTable) ExitScope() {
+	st.scope--
+
+	for len(st.locals) > 0 && st.locals[len(st.locals)-1].Depth > st.scope {
+		st.locals = st.locals[:len(st.locals)-1]
+	}
+}
+
+func (st *SymbolTable) LocalVariables() []Variable {
+	// collect all local variables in the current scope
+	locals := make([]Variable, 0)
+
+	for i := len(st.locals) - 1; i >= 0; i-- {
+		v := st.locals[i]
+
+		if v.Depth == st.scope && !v.Hidden {
+			locals = append(locals, *v)
+		}
+	}
+
+	return locals
+}
+
+// VisibleVariables returns debugger-visible bindings with innermost shadowing.
+func (st *SymbolTable) VisibleVariables() []Variable {
+	vars := make([]Variable, 0, len(st.locals)+len(st.globals))
+	seen := make(map[string]struct{}, len(st.locals)+len(st.globals))
+
+	add := func(v *Variable) {
+		if v == nil || v.Hidden || v.Name == IgnorePseudoVariable || v.Name == PseudoVariable {
+			return
+		}
+
+		if _, exists := seen[v.Name]; exists {
+			return
+		}
+
+		seen[v.Name] = struct{}{}
+		vars = append(vars, *v)
+	}
+
+	for i := len(st.locals) - 1; i >= 0; i-- {
+		add(st.locals[i])
+	}
+
+	names := make([]string, 0, len(st.globals))
+	for name := range st.globals {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		add(st.globals[name])
+	}
+
+	return vars
+}
+
+func (st *SymbolTable) ProjectionVariables() []Variable {
+	vars := make([]Variable, 0)
+	seenNames := make(map[string]struct{})
+	seenBindings := make(map[BindingID]struct{})
+
+	add := func(v *Variable) {
+		if v == nil {
+			return
+		}
+
+		if v.Hidden {
+			if v.ID != InvalidBindingID {
+				if _, ok := seenBindings[v.ID]; ok {
+					return
+				}
+
+				seenBindings[v.ID] = struct{}{}
+			}
+
+			vars = append(vars, *v)
+			return
+		}
+
+		if v.Name == IgnorePseudoVariable || v.Name == PseudoVariable {
+			return
+		}
+
+		if _, ok := seenNames[v.Name]; ok {
+			return
+		}
+
+		seenNames[v.Name] = struct{}{}
+		vars = append(vars, *v)
+	}
+
+	for i := len(st.locals) - 1; i >= 0; i-- {
+		v := st.locals[i]
+		if v.Depth == st.scope {
+			add(v)
+		}
+	}
+
+	for i := len(st.locals) - 1; i >= 0; i-- {
+		v := st.locals[i]
+		if v.Depth >= st.scope || !v.Mutable {
+			continue
+		}
+
+		add(v)
+	}
+
+	if len(st.globals) == 0 {
+		return vars
+	}
+
+	names := make([]string, 0, len(st.globals))
+	for name, v := range st.globals {
+		if v == nil || !v.Mutable {
+			continue
+		}
+
+		if _, ok := seenNames[name]; ok {
+			continue
+		}
+
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		add(st.globals[name])
+	}
+
+	return vars
+}
+
+func (st *SymbolTable) DeclareLocal(name string, typ ValueType) (bytecode.Operand, bool) {
+	return st.DeclareLocalWithOptions(name, typ, BindingOptions{})
+}
+
+func (st *SymbolTable) DeclareLocalWithOptions(name string, typ ValueType, opts BindingOptions) (bytecode.Operand, bool) {
+	reg := st.registers.Allocate()
+
+	if ok := st.AssignLocalWithOptions(name, typ, reg, opts); !ok {
+		return bytecode.NoopOperand, false
+	}
+
+	return reg, true
+}
+
+func (st *SymbolTable) AssignLocal(name string, typ ValueType, op bytecode.Operand) bool {
+	return st.AssignLocalWithOptions(name, typ, op, BindingOptions{})
+}
+
+func (st *SymbolTable) AssignLocalWithOptions(name string, typ ValueType, op bytecode.Operand, opts BindingOptions) bool {
+	if name != IgnorePseudoVariable && name != PseudoVariable {
+		// Check if the variable already exists in the current scope
+		for i := len(st.locals) - 1; i >= 0; i-- {
+			v := st.locals[i]
+
+			if v.Name == name && v.Depth == st.scope && !v.Hidden && !opts.Hidden {
+				return false
+			}
+		}
+	}
+
+	st.locals = append(st.locals, &Variable{
+		ID:       opts.ID,
+		Name:     name,
+		Kind:     SymbolLocal,
+		Register: op,
+		Depth:    st.scope,
+		Type:     typ,
+		Mutable:  opts.Mutable,
+		Storage:  opts.Storage,
+		Hidden:   opts.Hidden,
+	})
+
+	return true
+}
+
+func (st *SymbolTable) DeclareGlobal(name string, typ ValueType) (bytecode.Operand, bool) {
+	return st.DeclareGlobalWithOptions(name, typ, BindingOptions{})
+}
+
+func (st *SymbolTable) DeclareGlobalWithOptions(name string, typ ValueType, opts BindingOptions) (bytecode.Operand, bool) {
+	op := st.registers.Allocate()
+
+	if ok := st.AssignGlobalWithOptions(name, typ, op, opts); !ok {
+		return bytecode.NoopOperand, false
+	}
+
+	return op, true
+}
+
+func (st *SymbolTable) AssignGlobal(name string, typ ValueType, op bytecode.Operand) bool {
+	return st.AssignGlobalWithOptions(name, typ, op, BindingOptions{})
+}
+
+func (st *SymbolTable) AssignGlobalWithOptions(name string, typ ValueType, op bytecode.Operand, opts BindingOptions) bool {
+	if _, exists := st.globals[name]; exists {
+		return false
+	}
+
+	st.globals[name] = &Variable{
+		ID:       opts.ID,
+		Name:     name,
+		Kind:     SymbolGlobal,
+		Register: op,
+		Type:     typ,
+		Mutable:  opts.Mutable,
+		Storage:  opts.Storage,
+		Hidden:   opts.Hidden,
+	}
+
+	return true
+}
+
+func (st *SymbolTable) Constants() []runtime.Value {
+	return st.constants.All()
+}
+
+func (st *SymbolTable) AddConstant(val runtime.Value) bytecode.Operand {
+	return st.constants.Add(val)
+}
+
+func (st *SymbolTable) Constant(addr bytecode.Operand) runtime.Value {
+	return st.constants.Get(addr)
+}
+
+func (st *SymbolTable) Resolve(name string) (bytecode.Operand, SymbolKind, bool) {
+	if binding, ok := st.ResolveBinding(name); ok {
+		return bytecode.NewRegister(int(binding.Register)), binding.Kind, true
+	}
+
+	return bytecode.NoopOperand, SymbolLocal, false
+}
+
+func (st *SymbolTable) ResolveBinding(name string) (*Variable, bool) {
+	for i := len(st.locals) - 1; i >= 0; i-- {
+		v := st.locals[i]
+		if !v.Hidden && v.Name == name {
+			return v, true
+		}
+	}
+
+	if binding, ok := st.globals[name]; ok {
+		return binding, true
+	}
+
+	return nil, false
+}
+
+// ResolveBindingByID resolves both source-visible and hidden bindings by declaration identity.
+func (st *SymbolTable) ResolveBindingByID(id BindingID) (*Variable, bool) {
+	if id == InvalidBindingID {
+		return nil, false
+	}
+
+	for i := len(st.locals) - 1; i >= 0; i-- {
+		v := st.locals[i]
+		if v.ID == id {
+			return v, true
+		}
+	}
+
+	for _, binding := range st.globals {
+		if binding.ID == id {
+			return binding, true
+		}
+	}
+
+	return nil, false
+}
+
+func (st *SymbolTable) Lookup(name string) (*Variable, bool) {
+	return st.ResolveBinding(name)
+}

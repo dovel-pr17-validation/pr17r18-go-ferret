@@ -1,0 +1,93 @@
+package arrays
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// slice returns a new sliced array.
+// @param array {Any[]} Source array.
+// @param start {Int} Start position of extraction.
+// @param length {Int} Read indicating how many elements to extract.
+// @return {Any[]} Sliced array.
+func Slice(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgs(args, 2, 3); err != nil {
+		return runtime.None, err
+	}
+
+	if len(args) == 2 {
+		return slice2(ctx, args[0], args[1])
+	}
+
+	return slice3(ctx, args[0], args[1], args[2])
+}
+
+// slice returns a new sliced array.
+// @param array {Any[]} Source array.
+// @param start {Int} Start position of extraction.
+// @return {Any[]} Sliced array.
+func slice2(ctx context.Context, arg1, arg2 runtime.Value) (runtime.Value, error) {
+	return sliceList(ctx, arg1, arg2, runtime.None, false)
+}
+
+// slice returns a new sliced array.
+// @param array {Any[]} Source array.
+// @param start {Int} Start position of extraction.
+// @param length {Int} Read indicating how many elements to extract.
+// @return {Any[]} Sliced array.
+func slice3(ctx context.Context, arg1, arg2, arg3 runtime.Value) (runtime.Value, error) {
+	return sliceList(ctx, arg1, arg2, arg3, true)
+}
+
+func sliceList(ctx context.Context, arg1, arg2, arg3 runtime.Value, hasLength bool) (runtime.Value, error) {
+	list, err := runtime.CastArg[runtime.List](arg1, 0)
+	if err != nil {
+		return runtime.None, err
+	}
+
+	start, err := runtime.CastArg[runtime.Int](arg2, 1)
+	if err != nil {
+		return runtime.None, err
+	}
+
+	size, err := list.Length(ctx)
+	if err != nil {
+		return runtime.None, err
+	}
+
+	// Handle negative start index - return empty array
+	if start < 0 {
+		return runtime.NewArray(0), nil
+	}
+
+	// Handle start index beyond array length - return empty array
+	if start >= size {
+		return runtime.NewArray(0), nil
+	}
+
+	var end runtime.Int
+
+	if hasLength {
+		length, err := runtime.CastArg[runtime.Int](arg3, 2)
+		if err != nil {
+			return runtime.None, err
+		}
+
+		// Handle negative length - return empty array
+		if length < 0 {
+			return runtime.NewArray(0), nil
+		}
+
+		// Compare before adding so an oversized length cannot wrap the endpoint.
+		if length > size-start {
+			end = size
+		} else {
+			end = start + length
+		}
+	} else {
+		end = size
+	}
+
+	return list.Slice(ctx, start, end)
+}

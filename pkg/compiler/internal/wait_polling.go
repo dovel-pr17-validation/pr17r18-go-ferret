@@ -1,0 +1,279 @@
+package internal
+
+import (
+	"time"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/compiler/internal/core"
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type waitPredicatePollState struct {
+	baseEveryReg bytecode.Operand
+	pollReg      bytecode.Operand
+	intervalReg  bytecode.Operand
+	resultReg    bytecode.Operand
+	startReg     bytecode.Operand
+}
+
+const waitForDefaultEvery = runtime.Duration(100 * time.Millisecond)
+
+func (c *WaitCompiler) tryCompileWaitPredicateFastPath(config waitPredicateCompileConfig) (bytecode.Operand, bool) {
+	if len(config.whenExprs) > 0 {
+		return bytecode.NoopOperand, false
+	}
+
+	switch config.mode {
+	case waitForPredicateModeBool:
+		truth, ok := literalTruthinessFromExpression(config.predExpr)
+		if !ok {
+			return bytecode.NoopOperand, false
+		}
+
+		if truth {
+			return c.emitImmediateWaitBool(true), true
+		}
+
+		if config.timeoutReg != bytecode.NoopOperand {
+			c.ctx.Program.Emitter.EmitA(bytecode.OpSleep, config.timeoutReg)
+			return c.emitImmediateWaitBool(false), true
+		}
+
+		return bytecode.NoopOperand, false
+	case waitForPredicateModeValue:
+		present, ok := literalPresentFromExpression(config.predExpr)
+		if !ok {
+			return bytecode.NoopOperand, false
+		}
+
+		if present {
+			return c.exprs.Compile(config.predExpr), true
+		}
+
+		if config.timeoutReg != bytecode.NoopOperand {
+			c.ctx.Program.Emitter.EmitA(bytecode.OpSleep, config.timeoutReg)
+			return c.emitImmediateWaitNone(), true
+		}
+
+		return bytecode.NoopOperand, false
+	default:
+		exists, ok := literalExistsFromExpression(config.predExpr)
+		if !ok {
+			return bytecode.NoopOperand, false
+		}
+
+		cond := exists
+		if config.mode == waitForPredicateModeNotExists {
+			cond = !exists
+		}
+
+		if cond {
+			return c.emitImmediateWaitBool(true), true
+		}
+
+		if config.timeoutReg != bytecode.NoopOperand {
+			c.ctx.Program.Emitter.EmitA(bytecode.OpSleep, config.timeoutReg)
+			return c.emitImmediateWaitBool(false), true
+		}
+
+		return bytecode.NoopOperand, false
+	}
+}
+
+func (c *WaitCompiler) emitImmediateWaitBool(value bool) bytecode.Operand {
+	resultReg := c.ctx.Function.Registers.Allocate()
+	c.ctx.Program.Emitter.EmitBoolean(resultReg, value)
+
+	return resultReg
+}
+
+func (c *WaitCompiler) emitImmediateWaitNone() bytecode.Operand {
+	resultReg := c.ctx.Function.Registers.Allocate()
+	c.ctx.Program.Emitter.EmitLoadNone(resultReg)
+
+	return resultReg
+}
+
+func (c *WaitCompiler) initWaitPredicatePollState(mode waitForPredicateMode, config waitPredicateScheduleConfig) waitPredicatePollState {
+	state := waitPredicatePollState{
+		baseEveryReg: c.ctx.Function.Registers.Allocate(),
+	}
+
+	if config.everyReg != bytecode.NoopOperand {
+		c.ctx.Program.Emitter.EmitMove(state.baseEveryReg, config.everyReg)
+	} else {
+		c.ctx.Program.Emitter.EmitLoadConst(state.baseEveryReg, c.ctx.Function.Symbols.AddConstant(waitForDefaultEvery))
+		c.ctx.Function.Types.Set(state.baseEveryReg, core.TypeDuration)
+	}
+
+	state.pollReg = state.baseEveryReg
+	if config.backoff != core.RetryBackoffNone {
+		state.intervalReg = c.ctx.Function.Registers.Allocate()
+		c.ctx.Program.Emitter.EmitMove(state.intervalReg, state.baseEveryReg)
+		state.pollReg = state.intervalReg
+	}
+
+	state.resultReg = c.ctx.Function.Registers.Allocate()
+	if mode == waitForPredicateModeValue {
+		c.ctx.Program.Emitter.EmitLoadNone(state.resultReg)
+	} else {
+		c.ctx.Program.Emitter.EmitBoolean(state.resultReg, false)
+	}
+
+	if config.timeoutReg != bytecode.NoopOperand {
+		state.startReg = c.emitElapsed()
+	}
+
+	return state
+}
+
+func (c *WaitCompiler) emitWaitPredicatePollLoop(config waitPredicateCompileConfig, state waitPredicatePollState) {
+	start := c.ctx.Program.Emitter.NewLabel()
+	success := c.ctx.Program.Emitter.NewLabel()
+	timeoutLabel := c.ctx.Program.Emitter.NewLabel()
+	end := c.ctx.Program.Emitter.NewLabel()
+
+	c.ctx.Program.Emitter.MarkLabel(start)
+	valueReg := c.emitWaitPredicatePollIteration(config, state, start, success, timeoutLabel)
+
+	c.ctx.Program.Emitter.MarkLabel(success)
+	c.emitWaitSuccessResult(config.mode, state.resultReg, valueReg)
+	c.ctx.Program.Emitter.EmitJump(end)
+
+	c.ctx.Program.Emitter.MarkLabel(timeoutLabel)
+	c.emitWaitTimeoutResult(config.mode, state.resultReg)
+	c.ctx.Program.Emitter.MarkLabel(end)
+}
+
+func (c *WaitCompiler) emitWaitPredicatePollLoopWithRecovery(
+	config waitPredicateCompileConfig,
+	state waitPredicatePollState,
+	timeoutLabel, endLabel core.Label,
+) bytecode.Operand {
+	start := c.ctx.Program.Emitter.NewLabel()
+	success := c.ctx.Program.Emitter.NewLabel()
+
+	c.ctx.Program.Emitter.MarkLabel(start)
+	valueReg := c.emitWaitPredicatePollIteration(config, state, start, success, timeoutLabel)
+
+	c.ctx.Program.Emitter.MarkLabel(success)
+	c.emitWaitSuccessResult(config.mode, state.resultReg, valueReg)
+	c.ctx.Program.Emitter.EmitJump(endLabel)
+
+	return state.resultReg
+}
+
+func (c *WaitCompiler) emitWaitPredicatePollIteration(
+	config waitPredicateCompileConfig,
+	state waitPredicatePollState,
+	startLabel, successLabel, timeoutLabel core.Label,
+) bytecode.Operand {
+	valueReg := c.exprs.Compile(config.predExpr)
+	if config.mode == waitForPredicateModeValue {
+		retryLabel := c.ctx.Program.Emitter.NewLabel()
+		c.ctx.Program.Emitter.EmitJumpIfNone(valueReg, retryLabel)
+		c.emitWaitPredicateWhenConditions(config.whenExprs, valueReg, retryLabel)
+		c.ctx.Program.Emitter.EmitJump(successLabel)
+		c.ctx.Program.Emitter.MarkLabel(retryLabel)
+	} else {
+		condReg := c.emitWaitPredicateCondition(config.mode, valueReg)
+
+		if len(config.whenExprs) == 0 {
+			c.ctx.Program.Emitter.EmitJumpIfTrue(condReg, successLabel)
+		} else {
+			retryLabel := c.ctx.Program.Emitter.NewLabel()
+			c.ctx.Program.Emitter.EmitJumpIfFalse(condReg, retryLabel)
+			c.emitWaitPredicateWhenConditions(config.whenExprs, valueReg, retryLabel)
+			c.ctx.Program.Emitter.EmitJump(successLabel)
+			c.ctx.Program.Emitter.MarkLabel(retryLabel)
+		}
+	}
+
+	c.emitWaitPredicatePollRetry(config.waitPredicateScheduleConfig, state, startLabel, timeoutLabel)
+
+	return valueReg
+}
+
+func (c *WaitCompiler) emitWaitPredicatePollRetry(
+	config waitPredicateScheduleConfig,
+	state waitPredicatePollState,
+	startLabel, timeoutLabel core.Label,
+) {
+	elapsedReg := c.emitWaitPredicateTimeoutCheck(config.timeoutReg, state.startReg, timeoutLabel)
+	sleepIntervalReg := c.prepareWaitSleepInterval(config, state.pollReg)
+	c.emitWaitSleep(sleepIntervalReg, config.timeoutReg, elapsedReg, config.everyZero)
+
+	if config.backoff != core.RetryBackoffNone && !config.everyZero {
+		c.recovery.emitBackoffUpdate(config.backoff, state.intervalReg, state.baseEveryReg)
+		if config.capEveryReg != bytecode.NoopOperand {
+			c.emitClampMax(state.intervalReg, config.capEveryReg)
+		}
+	}
+
+	c.ctx.Program.Emitter.EmitJump(startLabel)
+}
+
+func (c *WaitCompiler) emitWaitPredicateWhenConditions(
+	whenExprs []fql.IExpressionContext,
+	valueReg bytecode.Operand,
+	retryLabel core.Label,
+) {
+	if len(whenExprs) == 0 {
+		return
+	}
+
+	c.ctx.Function.Symbols.EnterScope()
+	defer c.ctx.Function.Symbols.ExitScope()
+
+	c.ctx.Function.Symbols.AssignLocal(core.PseudoVariable, core.TypeUnknown, valueReg)
+
+	for _, whenExpr := range whenExprs {
+		condReg := c.exprs.CompileWithImplicitCurrent(whenExpr)
+		c.ctx.Program.Emitter.EmitJumpIfFalse(condReg, retryLabel)
+	}
+}
+
+func (c *WaitCompiler) emitWaitPredicateCondition(mode waitForPredicateMode, valueReg bytecode.Operand) bytecode.Operand {
+	switch mode {
+	case waitForPredicateModeExists:
+		return c.emitExistsCheck(valueReg)
+	case waitForPredicateModeNotExists:
+		existsReg := c.emitExistsCheck(valueReg)
+		condReg := c.ctx.Function.Registers.Allocate()
+		c.ctx.Program.Emitter.EmitAB(bytecode.OpNot, condReg, existsReg)
+
+		return condReg
+	default:
+		condReg := c.ctx.Function.Registers.Allocate()
+		c.ctx.Program.Emitter.EmitAB(bytecode.OpCastBool, condReg, valueReg)
+
+		return condReg
+	}
+}
+
+func (c *WaitCompiler) emitWaitSuccessResult(mode waitForPredicateMode, resultReg, valueReg bytecode.Operand) {
+	if mode == waitForPredicateModeValue {
+		c.ctx.Program.Emitter.EmitMove(resultReg, valueReg)
+		return
+	}
+
+	c.ctx.Program.Emitter.EmitBoolean(resultReg, true)
+}
+
+func (c *WaitCompiler) emitWaitTimeoutResult(mode waitForPredicateMode, resultReg bytecode.Operand) {
+	if mode == waitForPredicateModeValue {
+		c.ctx.Program.Emitter.EmitLoadNone(resultReg)
+		return
+	}
+
+	c.ctx.Program.Emitter.EmitBoolean(resultReg, false)
+}
+
+func (c *WaitCompiler) emitExistsCheck(val bytecode.Operand) bytecode.Operand {
+	dst := c.ctx.Function.Registers.Allocate()
+	c.ctx.Program.Emitter.EmitAB(bytecode.OpExists, dst, val)
+	c.ctx.Function.Types.Set(dst, core.TypeBool)
+
+	return dst
+}

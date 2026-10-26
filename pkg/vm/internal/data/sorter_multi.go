@@ -1,0 +1,106 @@
+package data
+
+import (
+	"context"
+	"io"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type MultiSorter struct {
+	*runtime.Box[runtime.List]
+	directions []runtime.SortDirection
+	sorted     bool
+}
+
+func NewMultiSorter(directions []runtime.SortDirection) Transformer {
+	return &MultiSorter{
+		Box:        &runtime.Box[runtime.List]{Value: runtime.NewArray(8)},
+		directions: directions,
+		sorted:     false,
+	}
+}
+
+func (s *MultiSorter) Iterate(ctx context.Context) (runtime.Iterator, error) {
+	if !s.sorted {
+		if err := s.sort(ctx); err != nil {
+			return nil, err
+		}
+
+		s.sorted = true
+	}
+
+	iter, err := s.Value.Iterate(ctx)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return NewKVIterator(iter), nil
+}
+
+func (s *MultiSorter) Set(ctx context.Context, key, value runtime.Value) error {
+	if err := s.Value.Append(ctx, NewKV(key, value)); err != nil {
+		return err
+	}
+
+	s.sorted = false
+
+	return nil
+}
+
+func (s *MultiSorter) sort(ctx context.Context) error {
+	return runtime.SortListWith(ctx, s.Value, func(ctx context.Context, first, second runtime.Value) (runtime.Ordering, error) {
+		firstKV := first.(*KV)
+		secondKV := second.(*KV)
+
+		firstKVKey := firstKV.Key.(runtime.List)
+		secondKVKey := secondKV.Key.(runtime.List)
+
+		for idx, direction := range s.directions {
+			firstKey, err := firstKVKey.At(ctx, runtime.NewInt(idx))
+			if err != nil {
+				return runtime.Equal, err
+			}
+
+			secondKey, err := secondKVKey.At(ctx, runtime.NewInt(idx))
+			if err != nil {
+				return runtime.Equal, err
+			}
+
+			comp, err := runtime.CompareValues(ctx, firstKey, secondKey)
+			if err != nil {
+				return runtime.Equal, err
+			}
+
+			if comp != runtime.Equal {
+				if direction == runtime.SortDirectionAsc {
+					return comp, nil
+				}
+
+				return -comp, nil
+			}
+		}
+
+		return runtime.Equal, nil
+	})
+}
+
+func (s *MultiSorter) Get(_ context.Context, _ runtime.Value) (runtime.Value, error) {
+	return runtime.None, runtime.ErrNotSupported
+}
+
+func (s *MultiSorter) Length(ctx context.Context) (runtime.Int, error) {
+	return s.Value.Length(ctx)
+}
+
+func (s *MultiSorter) Close() error {
+	val := s.Value
+	s.Value = nil
+
+	if closer, ok := val.(io.Closer); ok {
+		return closer.Close()
+	}
+
+	return nil
+}

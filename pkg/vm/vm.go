@@ -1,0 +1,1929 @@
+package vm
+
+import (
+	"context"
+	"errors"
+	"io"
+
+	"github.com/ziflex/go-options"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+	"github.com/MontFerret/ferret/v2/pkg/internal/operator"
+	"github.com/MontFerret/ferret/v2/pkg/rnd"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/vm/internal/data"
+	"github.com/MontFerret/ferret/v2/pkg/vm/internal/diagnostics"
+	"github.com/MontFerret/ferret/v2/pkg/vm/internal/mem"
+)
+
+type VM struct {
+	closeErr            error
+	sourcePointObserver sourcePointObserver
+	cache               *mem.Cache
+	program             *bytecode.Program
+	plan                execPlan
+	config              config
+	state               execState
+	closed              bool
+}
+
+// New creates a VM for program using the default configuration.
+func New(program *bytecode.Program) (*VM, error) {
+	return NewWith(program)
+}
+
+// NewWith creates a VM for program using opts. Program validation and execution
+// planning happen before options are applied, and option errors are returned
+// without creating a VM.
+func NewWith(program *bytecode.Program, opts ...Option) (*VM, error) {
+	if err := validate(program); err != nil {
+		return nil, err
+	}
+
+	plan, err := buildExecPlan(program)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := options.ApplyTo(defaultConfig(), opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	vm := &VM{
+		cache:   mem.NewCache(len(program.Bytecode), len(program.Functions.Host), cfg.shapeCacheLimit),
+		program: program,
+		plan:    plan,
+		config:  cfg,
+	}
+	vm.state.init(program)
+
+	if vm.config.testing.Options.BenchmarkMode {
+		vm.config.testing.SetBenchmark(&Result{closed: true, root: runtime.None})
+	}
+
+	return vm, nil
+}
+
+// Run executes the program until completion, failure, or a VM cancellation
+// safepoint. Context-aware external operations receive ctx and remain
+// responsible for observing cancellation while they retain control. A nil
+// context is invalid; callers must supply an explicit execution lifetime.
+func (vm *VM) Run(ctx context.Context, env *Environment) (*Result, error) {
+	if err := validateOperationContext(ctx); err != nil {
+		return nil, err
+	}
+
+	if vm == nil || vm.closed {
+		return nil, runtime.Error(runtime.ErrInvalidOperation, "vm is closed")
+	}
+
+	bench := vm.config.testing.Benchmark
+
+	if bench != nil && !bench.closed {
+		return nil, runtime.Error(runtime.ErrInvalidOperation, "benchmark result must be closed before next run")
+	}
+
+	switch vm.config.panicPolicy {
+	case PanicPropagate:
+		defer func() {
+			if r := recover(); r != nil {
+				vm.state.endRun()
+				panic(r)
+			}
+		}()
+
+		root, err := vm.runUnchecked(ctx, env)
+		if err != nil {
+			vm.state.endRun()
+			return nil, err
+		}
+
+		if bench != nil {
+			return vm.state.finishRunInto(root, bench), nil
+		}
+
+		return vm.state.finishRun(root), nil
+	default:
+		root, err := vm.runRecovered(ctx, env)
+		if err != nil {
+			vm.state.endRun()
+			return nil, err
+		}
+
+		if bench != nil {
+			return vm.state.finishRunInto(root, bench), nil
+		}
+
+		return vm.state.finishRun(root), nil
+	}
+}
+
+// Close permanently releases the VM's execution state. Closed VMs must not be reused.
+func (vm *VM) Close() error {
+	if vm == nil {
+		return nil
+	}
+
+	if vm.closed {
+		return vm.closeErr
+	}
+
+	vm.closed = true
+	vm.config.testing.Close()
+	vm.closeErr = errors.Join(vm.closeErr, vm.state.endRunWithError())
+	vm.cache = nil
+	vm.program = nil
+	vm.plan = execPlan{}
+	vm.state = execState{}
+	vm.config = config{}
+	vm.sourcePointObserver = nil
+
+	return vm.closeErr
+}
+
+func (vm *VM) runRecovered(ctx context.Context, env *Environment) (result runtime.Value, err error) {
+	defer func() {
+		state := &vm.state
+
+		if r := recover(); r != nil {
+			err = state.runtimeErrorFromPanic(r)
+			result = nil
+
+			return
+		}
+
+		if err != nil {
+			err = state.wrapRuntimeError(err)
+		}
+	}()
+
+	var action sourcePointAction
+	result, action, err = vm.runCore(ctx, env, false)
+	if err == nil && action != sourcePointContinue {
+		err = runtime.Error(runtime.ErrInvalidOperation, "source point observer interrupted normal execution")
+	}
+
+	return result, err
+}
+
+func (vm *VM) runUnchecked(ctx context.Context, env *Environment) (runtime.Value, error) {
+	result, action, err := vm.runCore(ctx, env, false)
+	if err == nil && action != sourcePointContinue {
+		err = runtime.Error(runtime.ErrInvalidOperation, "source point observer interrupted normal execution")
+	}
+
+	if err != nil {
+		var invariantErr *diagnostics.InvariantError
+
+		if errors.As(err, &invariantErr) {
+			panic(err)
+		}
+
+		return nil, vm.state.wrapRuntimeError(err)
+	}
+
+	return result, nil
+}
+
+func (vm *VM) runCore(ctx context.Context, env *Environment, retained bool) (runtime.Value, sourcePointAction, error) {
+	state := &vm.state
+
+	if !retained {
+		if env == nil {
+			env = noopEnv
+		}
+
+		if err := state.startRun(env); err != nil {
+			return nil, sourcePointContinue, err
+		}
+
+		if err := warmup(vm, env); err != nil {
+			return nil, sourcePointContinue, err
+		}
+	}
+
+	instructions := vm.plan.instructions
+	constants := vm.program.Constants
+	aggregatePlans := vm.program.Metadata.AggregatePlans
+	shapeCache := vm.cache.ShapeCache
+	hostFunctions := vm.cache.HostFunctions
+	udfs := vm.program.Functions.UserDefined
+	hostCallDescriptors := vm.plan.hostCallDescriptors
+	udfCallDescriptors := vm.plan.udfCallDescriptors
+	udfTailCallDescriptors := vm.plan.udfTailCallDescriptors
+	paramSlots := state.scratch.Params
+	// The VM owns query cancellation at explicit execution safepoints. Code
+	// between safepoints is atomic unless an invoked operation honors ctx.
+	cancellation := newExecutionCancellation(ctx)
+
+	for state.pc < len(instructions) {
+		pc := state.pc
+		inst := &instructions[pc]
+		op := inst.Opcode
+		dst, src1, src2 := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+		reg := state.registers
+		state.pc = pc + 1
+
+		switch op {
+		case bytecode.OpSourcePoint:
+			if vm.sourcePointObserver == nil {
+				continue
+			}
+
+			action, err := vm.sourcePointObserver.onSourcePoint(ctx, sourcePointState{
+				pc:      pc,
+				pointID: bytecode.DebugPointID(dst),
+				depth:   state.frames.Len(),
+			})
+
+			if err != nil {
+				return nil, sourcePointTerminate, err
+			}
+
+			switch action {
+			case sourcePointContinue:
+				continue
+			case sourcePointPause, sourcePointTerminate:
+				state.pc = pc
+				return nil, action, nil
+			default:
+				return nil, sourcePointTerminate, runtime.Errorf(runtime.ErrUnexpected, "unknown source point action %d at pc %d", action, pc)
+			}
+		case bytecode.OpReturn:
+			retVal := reg[dst]
+
+			if state.returnToCaller(retVal) {
+				continue
+			}
+			if err := cancellation.Check(); err != nil {
+				return nil, sourcePointContinue, err
+			}
+
+			state.writeBorrowedRegister(bytecode.NoopOperand, retVal)
+			return state.registers[bytecode.NoopOperand], sourcePointContinue, nil
+		case bytecode.OpJump:
+			if cancellation.done != nil && inst.isBackedge(pc) {
+				if err := cancellation.checkReady(); err != nil {
+					return nil, sourcePointContinue, err
+				}
+			}
+
+			state.pc = int(dst)
+		case bytecode.OpJumpIfFalse:
+			if !coerceBool(reg[src1]) {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfTrue:
+			if coerceBool(reg[src1]) {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfNone:
+			if reg[src1] == runtime.None {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfNe:
+			matches, err := runtime.EvaluateComparison(ctx, operator.NotEqual, reg[src1], reg[src2])
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if matches {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfNeConst:
+			right := constants[src2.Constant()]
+			matches, err := runtime.EvaluateComparison(ctx, operator.NotEqual, reg[src1], right)
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if matches {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfEq:
+			matches, err := runtime.EvaluateComparison(ctx, operator.Equal, reg[src1], reg[src2])
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if matches {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfEqConst:
+			right := constants[src2.Constant()]
+			matches, err := runtime.EvaluateComparison(ctx, operator.Equal, reg[src1], right)
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if matches {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfMissingProperty:
+			obj, ok := reg[src1].(runtime.Map)
+			if !ok {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+
+				continue
+			}
+
+			key, ok := reg[src2].(runtime.String)
+			if !ok {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+
+				continue
+			}
+			has, err := obj.ContainsKey(ctx, key)
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			if !has {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpJumpIfMissingPropertyConst:
+			obj, ok := reg[src1].(runtime.Map)
+			if !ok {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+
+				continue
+			}
+
+			key, ok := constants[src2.Constant()].(runtime.String)
+			if !ok {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+
+				continue
+			}
+			has, err := obj.ContainsKey(ctx, key)
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			if !has {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpMatchLoadPropertyConst:
+			key, ok := constants[src2.Constant()].(runtime.String)
+			if !ok {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = inst.InlineSlot
+
+				continue
+			}
+			if vm.matchLoadPropertyConst(ctx, pc, inst, dst, reg[src1], key) {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				continue
+			}
+		case bytecode.OpFail:
+			if !dst.IsConstant() {
+				callErr := runtime.Error(runtime.ErrInvalidOperation, "FAIL expects a constant string message")
+				state.raiseRuntimeAt(pc, callErr, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			idx := dst.Constant()
+			if idx < 0 || idx >= len(constants) {
+				callErr := runtime.Error(runtime.ErrInvalidOperation, "FAIL expects a valid constant string message")
+				state.raiseRuntimeAt(pc, callErr, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			msg, ok := constants[idx].(runtime.String)
+			if !ok {
+				callErr := runtime.TypeErrorOf(constants[idx], runtime.TypeString)
+				state.raiseRuntimeAt(pc, callErr, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			callErr := runtime.Error(runtime.ErrInvalidOperation, msg.String())
+			state.raiseRuntimeAt(pc, callErr, recoverDefault, bytecode.NoopOperand, nil, false)
+		case bytecode.OpFailTimeout:
+			state.raiseRuntimeAt(pc, runtime.ErrTimeout, recoverDefault, bytecode.NoopOperand, nil, false)
+		case bytecode.OpRethrow:
+			state.rethrowRuntimeAt(pc)
+		case bytecode.OpHCall, bytecode.OpProtectedHCall:
+			callSlot := inst.InlineSlot
+			if callSlot < 0 || callSlot >= len(hostCallDescriptors) {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid host call slot",
+					runtime.Errorf(runtime.ErrUnexpected, "invalid host call slot %d at pc %d", callSlot, pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			call := &hostCallDescriptors[callSlot]
+			if !call.ID.InRange(len(hostFunctions)) {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid host binding id",
+					runtime.Errorf(runtime.ErrUnexpected, "invalid host binding id %d at pc %d", call.ID, pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			hostFn := &hostFunctions[call.ID]
+			out, err := callCachedHostFunction(ctx, cancellation, call, hostFn, reg, &state.scratch)
+			state.setCallResult(pc, op, dst, out, err)
+		case bytecode.OpCall, bytecode.OpProtectedCall:
+			callID := inst.InlineSlot
+			call := &udfCallDescriptors[callID]
+
+			if !call.ID.InRange(len(udfs)) {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid udf call slot",
+					runtime.Errorf(runtime.ErrUnexpected, "invalid udf call slot %d at pc %d", callID, pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			udf := &udfs[call.ID]
+			if err := cancellation.Check(); err != nil {
+				return nil, sourcePointContinue, err
+			}
+
+			if err := callUdf(state, call, udf); err != nil {
+				state.setCallResult(pc, op, dst, runtime.None, err)
+			}
+		case bytecode.OpTailCall:
+			callID := inst.InlineSlot
+			call := &udfTailCallDescriptors[callID]
+
+			if !call.ID.InRange(len(udfs)) {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid udf call slot",
+					runtime.Errorf(runtime.ErrUnexpected, "invalid udf call slot %d at pc %d", callID, pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			udf := &udfs[call.ID]
+			if err := cancellation.Check(); err != nil {
+				return nil, sourcePointContinue, err
+			}
+
+			if err := tailCallUdf(state, call, udf); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpDispatch:
+			dispatcher, eventName, payload, opts, err := coerceDispatchArgs(ctx, reg[dst], reg[src1], reg[src2])
+
+			if err != nil {
+				state.setOrRaiseDefault(pc, dst, runtime.None, err)
+
+				break
+			}
+
+			err = dispatcher.Dispatch(ctx, runtime.DispatchEvent{
+				Name:    eventName,
+				Payload: payload,
+				Options: opts,
+			})
+			state.setOrRaiseDefault(pc, dst, runtime.None, err)
+		case bytecode.OpMove:
+			reg[dst] = reg[src1]
+		case bytecode.OpMoveTracked:
+			state.copyRegister(dst, src1)
+		case bytecode.OpLoadNone:
+			reg[dst] = runtime.None
+		case bytecode.OpLoadBool:
+			reg[dst] = runtime.Boolean(src1 == 1)
+		case bytecode.OpLoadZero:
+			reg[dst] = runtime.ZeroInt
+		case bytecode.OpLoadConst:
+			reg[dst] = constants[src1.Constant()]
+		case bytecode.OpLoadParam:
+			state.writeBorrowedRegister(dst, paramSlots[int(src1)-1])
+		case bytecode.OpMakeCell:
+			state.makeCell(dst, state.valueOf(constants, src1))
+		case bytecode.OpLoadCell:
+			handle, ok := state.cellHandleOf(src1)
+			if !ok {
+				state.raiseInvariantAt(pc, runtime.Error(runtime.ErrInvalidOperation, "expected cell handle"))
+
+				break
+			}
+
+			if _, err := state.loadCell(dst, handle); err != nil {
+				state.raiseInvariantAt(pc, err)
+			}
+		case bytecode.OpStoreCell:
+			handle, ok := state.cellHandleOf(dst)
+			if !ok {
+				state.raiseInvariantAt(pc, runtime.Error(runtime.ErrInvalidOperation, "expected cell handle"))
+
+				break
+			}
+
+			if err := state.storeCell(handle, state.valueOf(constants, src1)); err != nil {
+				state.raiseInvariantAt(pc, err)
+			}
+		case bytecode.OpLoadArray:
+			reg[dst] = runtime.NewArray(int(src1))
+		case bytecode.OpLoadObject:
+			reg[dst] = data.NewFastObjectOf(shapeCache, vm.config.fastObjectDictThreshold, int(src1))
+		case bytecode.OpLoadRange:
+			start, err := runtime.ToInt(ctx, reg[src1])
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			end, err := runtime.ToInt(ctx, reg[src2])
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			reg[dst] = runtime.NewRange(start, end)
+		case bytecode.OpLoadAggregateKey:
+			selectorVal, ok := constants[src2.Constant()].(runtime.Int)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid aggregate selector index constant",
+					runtime.Errorf(runtime.ErrUnexpected, "expected aggregate selector index constant at pc %d", pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			selector, ok := runtime.ToNativeInt(selectorVal)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid aggregate selector index constant",
+					runtime.Error(runtime.ErrRange, "aggregate selector index exceeds native integer range"),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			reg[dst] = data.NewAggregateKey(reg[src1], selector)
+		case bytecode.OpAssertDestructure:
+			value := reg[dst]
+			if value == runtime.None {
+				break
+			}
+
+			mode := bytecode.DestructureMode(src1)
+			compatible := false
+
+			switch mode {
+			case bytecode.DestructureModeObject:
+				_, compatible = value.(runtime.KeyReadable)
+			case bytecode.DestructureModeArray:
+				_, compatible = value.(runtime.IndexReadable)
+			}
+
+			if !compatible {
+				err := diagnostics.DestructureErrorOf(value, mode.String())
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpLoadIndex, bytecode.OpLoadIndexOptional:
+			src := reg[src1]
+			optional := op == bytecode.OpLoadIndexOptional
+			arg := reg[src2]
+
+			// TODO: inline loadIndexAndSet for better performance
+			vm.loadIndexAndSet(ctx, dst, pc, src, arg, optional)
+		case bytecode.OpLoadKey, bytecode.OpLoadKeyOptional:
+			src := reg[src1]
+			optional := op == bytecode.OpLoadKeyOptional
+			arg := reg[src2]
+
+			// TODO: inline loadIndexAndSet for better performance
+			vm.loadKeyAndSet(ctx, dst, pc, src, arg, optional)
+		case bytecode.OpLoadProperty, bytecode.OpLoadPropertyOptional:
+			src := reg[src1]
+			optional := op == bytecode.OpLoadPropertyOptional
+			prop := reg[src2]
+
+			// TODO: inline loadIndexAndSet for better performance
+			// I guess the reason it cannot inline is due to a different control flow
+			vm.loadPropertyAndSet(ctx, dst, pc, src, prop, optional)
+		case bytecode.OpLoadIndexConst, bytecode.OpLoadIndexOptionalConst:
+			src := reg[src1]
+			optional := op == bytecode.OpLoadIndexOptionalConst
+			arg := constants[src2.Constant()]
+
+			vm.loadIndexAndSet(ctx, dst, pc, src, arg, optional)
+		case bytecode.OpLoadKeyConst, bytecode.OpLoadKeyOptionalConst:
+			src := reg[src1]
+			optional := op == bytecode.OpLoadKeyOptionalConst
+			arg := constants[src2.Constant()]
+
+			vm.loadKeyConstAndSet(ctx, dst, pc, inst, src, arg, optional)
+		case bytecode.OpLoadPropertyConst, bytecode.OpLoadPropertyOptionalConst:
+			src := reg[src1]
+			optional := op == bytecode.OpLoadPropertyOptionalConst
+			prop := constants[src2.Constant()]
+
+			vm.loadPropertyConstAndSet(ctx, dst, pc, inst, src, prop, optional)
+		case bytecode.OpPush:
+			ds := reg[dst].(runtime.Appendable)
+
+			if err := ds.Append(ctx, reg[src1]); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(reg[src1])
+		case bytecode.OpPushKV:
+			tr := reg[dst].(runtime.KeyWritable)
+
+			if err := tr.Set(ctx, reg[src1], reg[src2]); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(reg[src1])
+			state.retireOwnership(reg[src2])
+		case bytecode.OpCounterInc:
+			collector, ok := reg[dst].(*data.CounterCollector)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid counter collector",
+					runtime.Errorf(runtime.ErrUnexpected, "expected counter collector at pc %d", pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			collector.Increment()
+		case bytecode.OpArrayPush:
+			ds := reg[dst].(*runtime.Array)
+			_ = ds.Append(ctx, reg[src1])
+			state.retireOwnership(reg[src1])
+		case bytecode.OpArraySpread:
+			destination, ok := reg[dst].(*runtime.Array)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid array spread destination",
+					runtime.Errorf(runtime.ErrUnexpected, "expected array at pc %d", pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			if err := spreadArray(ctx, destination, reg[src1]); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpAggregateReduce:
+			values, ok := reg[src1].(runtime.List)
+			if !ok {
+				state.raiseInvariantAt(pc, diagnostics.NewInvariantError("invalid aggregate reduction input", runtime.Errorf(runtime.ErrUnexpected, "expected collected list at pc %d", pc)))
+
+				break
+			}
+
+			value, err := data.ReduceAggregate(ctx, values, bytecode.AggregateKind(src2))
+			state.setOrRaiseDefault(pc, dst, value, err)
+		case bytecode.OpAggregateUpdate:
+			collector, ok := reg[dst].(*data.AggregateCollector)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid aggregate collector",
+					runtime.Errorf(runtime.ErrUnexpected, "expected aggregate collector at pc %d", pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			if err := collector.UpdateAggregate(inst.InlineSlot, reg[src1]); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(reg[src1])
+		case bytecode.OpAggregateGroupUpdate:
+			collector, ok := reg[dst].(*data.GroupedAggregateCollector)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid grouped aggregate collector",
+					runtime.Errorf(runtime.ErrUnexpected, "expected grouped aggregate collector at pc %d", pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+			if err := collector.UpdateAggregate(ctx, reg[src1], reg[src2], inst.InlineSlot); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(reg[src1])
+			state.retireOwnership(reg[src2])
+		case bytecode.OpObjectSet:
+			key := runtime.ToString(reg[src1])
+			value := reg[src2]
+			obj, ok := reg[dst].(*data.FastObject)
+
+			if ok {
+				_ = obj.Set(ctx, key, value)
+				state.retireOwnership(value)
+
+				continue
+			}
+
+			writable, ok := reg[dst].(runtime.KeyWritable)
+			if ok {
+				if err := writable.Set(ctx, key, value); err != nil {
+					state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+					break
+				}
+
+				state.retireOwnership(value)
+
+				continue
+			}
+
+			callErr := runtime.TypeErrorOf(reg[dst], runtime.TypeObject)
+			state.raiseRuntimeAt(pc, callErr, recoverDefault, bytecode.NoopOperand, nil, false)
+		case bytecode.OpObjectSetConst:
+			objVal := reg[dst]
+			key := runtime.ToString(constants[src1.Constant()])
+			value := reg[src2]
+
+			if obj, ok := objVal.(*data.FastObject); ok {
+				vm.objectSetConstCached(inst, obj, key, value)
+				state.retireOwnership(value)
+
+				continue
+			}
+
+			writable, ok := reg[dst].(runtime.KeyWritable)
+			if ok {
+				if err := writable.Set(ctx, key, value); err != nil {
+					state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+					break
+				}
+
+				state.retireOwnership(value)
+
+				continue
+			}
+
+			callErr := runtime.TypeErrorOf(reg[dst], runtime.TypeObject)
+			state.raiseRuntimeAt(pc, callErr, recoverDefault, bytecode.NoopOperand, nil, false)
+		case bytecode.OpObjectSpread:
+			destination, ok := reg[dst].(*data.FastObject)
+			if !ok {
+				invariantErr := diagnostics.NewInvariantError(
+					"invalid object spread destination",
+					runtime.Errorf(runtime.ErrUnexpected, "expected object at pc %d", pc),
+				)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			if err := spreadObject(ctx, destination, reg[src1]); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpSetIndex:
+			target := reg[dst]
+			index := reg[src1]
+			value := reg[src2]
+
+			if err := vm.setIndex(ctx, target, index, value); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(value)
+		case bytecode.OpSetIndexConst:
+			target := reg[dst]
+			index := constants[src1.Constant()]
+			value := reg[src2]
+
+			if err := vm.setIndex(ctx, target, index, value); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(value)
+		case bytecode.OpSetKey:
+			target := reg[dst]
+			key := reg[src1]
+			value := reg[src2]
+
+			if err := vm.setKey(ctx, target, key, value); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(value)
+		case bytecode.OpSetKeyConst:
+			target := reg[dst]
+			key := constants[src1.Constant()]
+			value := reg[src2]
+
+			if obj, ok := target.(*data.FastObject); ok {
+				vm.objectSetConstCached(inst, obj, runtime.ToString(key), value)
+				state.retireOwnership(value)
+
+				continue
+			}
+
+			if err := vm.setKey(ctx, target, key, value); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(value)
+		case bytecode.OpSetProperty:
+			target := reg[dst]
+			prop := reg[src1]
+			value := reg[src2]
+
+			if err := vm.setProperty(ctx, target, prop, value); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(value)
+		case bytecode.OpSetPropertyConst:
+			target := reg[dst]
+			prop := constants[src1.Constant()]
+			value := reg[src2]
+
+			if obj, ok := target.(*data.FastObject); ok {
+				if key, ok := prop.(runtime.String); ok {
+					vm.objectSetConstCached(inst, obj, key, value)
+					state.retireOwnership(value)
+
+					continue
+				}
+			}
+
+			if err := vm.setProperty(ctx, target, prop, value); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.retireOwnership(value)
+		case bytecode.OpDeleteKey:
+			target := reg[dst]
+			key := reg[src1]
+
+			if err := vm.deleteKey(ctx, target, key); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpDeleteKeyConst:
+			target := reg[dst]
+			key := constants[src1.Constant()]
+
+			if err := vm.deleteKey(ctx, target, key); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpDeleteProperty:
+			target := reg[dst]
+			prop := reg[src1]
+
+			if err := vm.deleteProperty(ctx, target, prop); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpDeletePropertyConst:
+			target := reg[dst]
+			prop := constants[src1.Constant()]
+
+			if err := vm.deleteProperty(ctx, target, prop); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpIter:
+			input := reg[src1]
+			iterable, ok := input.(runtime.Iterable)
+
+			if ok {
+				iterator, err := iterable.Iterate(ctx)
+
+				if err == nil {
+					state.writeProducedRegister(dst, data.WrapIterator(iterator))
+
+					continue
+				}
+
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			callErr := runtime.TypeErrorOf(input, runtime.TypeIterable)
+			state.raiseRuntimeAt(pc, callErr, recoverDefault, dst, data.NoopIter, true)
+		case bytecode.OpIterNext:
+			iterator := reg[src1].(data.IteratorState)
+
+			if err := iterator.Next(ctx); err != nil {
+				if errors.Is(err, io.EOF) {
+					if cancellation.done != nil && inst.isBackedge(pc) {
+						if err := cancellation.checkReady(); err != nil {
+							return nil, sourcePointContinue, err
+						}
+					}
+
+					state.pc = int(dst)
+
+					continue
+				}
+
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpIterNextTimeout:
+			iterator := reg[src1].(data.IteratorState)
+
+			if err := iterator.Next(ctx); err != nil {
+				if errors.Is(err, io.EOF) {
+					if cancellation.done != nil && inst.isBackedge(pc) {
+						if err := cancellation.checkReady(); err != nil {
+							return nil, sourcePointContinue, err
+						}
+					}
+
+					state.writeBorrowedRegister(src2, runtime.False)
+					state.pc = int(dst)
+
+					continue
+				}
+
+				if errors.Is(err, runtime.ErrTimeout) {
+					if cancellation.done != nil && inst.isBackedge(pc) {
+						if err := cancellation.checkReady(); err != nil {
+							return nil, sourcePointContinue, err
+						}
+					}
+
+					state.writeBorrowedRegister(src2, runtime.True)
+					state.pc = int(dst)
+
+					continue
+				}
+
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.writeBorrowedRegister(src2, runtime.False)
+		case bytecode.OpIterValue:
+			iterator := reg[src1].(data.IteratorState)
+			state.writeBorrowedRegister(dst, iterator.Value())
+		case bytecode.OpIterKey:
+			iterator := reg[src1].(data.IteratorState)
+			state.writeBorrowedRegister(dst, iterator.Key())
+		case bytecode.OpIterSkip:
+			iterState := runtime.ToIntSafe(ctx, reg[src1])
+			threshold := runtime.ToIntSafe(ctx, reg[src2])
+
+			if iterState < threshold {
+				iterState++
+				state.writeBorrowedRegister(src1, iterState)
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpIterLimit:
+			iterState := runtime.ToIntSafe(ctx, reg[src1])
+			threshold := runtime.ToIntSafe(ctx, reg[src2])
+
+			if iterState < threshold {
+				iterState++
+				state.writeBorrowedRegister(src1, iterState)
+			} else {
+				if cancellation.done != nil && inst.isBackedge(pc) {
+					if err := cancellation.checkReady(); err != nil {
+						return nil, sourcePointContinue, err
+					}
+				}
+
+				state.pc = int(dst)
+			}
+		case bytecode.OpStream:
+			observable, eventName, opts, err := coerceSubscribeArgs(reg[dst], reg[src1], reg[src2])
+
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			stream, err := observable.Subscribe(ctx, runtime.Subscription{
+				EventName: eventName,
+				Options:   opts,
+			})
+
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			state.writeProducedRegister(dst, data.NewStreamValue(stream))
+		case bytecode.OpStreamGroup:
+			streams, err := subscribeStreamGroup(ctx, reg[dst], reg[src1], reg[src2])
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			state.writeProducedRegister(dst, data.NewStreamGroupValue(streams))
+		case bytecode.OpStreamIter:
+			stream := reg[src1].(data.StreamIterable)
+
+			var timeout runtime.Duration
+
+			if reg[src2] != runtime.None {
+				t, err := runtime.ToDuration(ctx, reg[src2])
+
+				if err != nil {
+					state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+					break
+				}
+
+				if t < 0 {
+					state.raiseRuntimeAt(pc, runtime.Error(runtime.ErrInvalidArgument, "stream timeout must not be negative"), recoverDefault, bytecode.NoopOperand, nil, false)
+
+					break
+				}
+
+				timeout = t
+			}
+
+			state.writeProducedRegister(dst, stream.Iterate(timeout))
+		case bytecode.OpStreamGroupArmDone:
+			if err := cancellation.Check(); err != nil {
+				return nil, sourcePointContinue, err
+			}
+
+			group := reg[dst].(data.StreamGroupController)
+			armIndex, err := runtime.ToInt(ctx, reg[src1])
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if err := group.ArmDone(armIndex); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpQuery:
+			src := readOperandValue(reg, constants, src1)
+			descriptor := readOperandValue(reg, constants, src2)
+
+			out, err := applyQuery(ctx, src, descriptor)
+			state.setProducedOrRaiseDefault(pc, dst, out, err)
+		case bytecode.OpQueryExists:
+			src := readOperandValue(reg, constants, src1)
+			descriptor := readOperandValue(reg, constants, src2)
+
+			out, err := applyQueryExists(ctx, src, descriptor)
+			state.setOrRaiseDefault(pc, dst, out, err)
+		case bytecode.OpQueryCount:
+			src := readOperandValue(reg, constants, src1)
+			descriptor := readOperandValue(reg, constants, src2)
+
+			out, err := applyQueryCount(ctx, src, descriptor)
+			state.setOrRaiseDefault(pc, dst, out, err)
+		case bytecode.OpQueryOne:
+			src := readOperandValue(reg, constants, src1)
+			descriptor := readOperandValue(reg, constants, src2)
+
+			out, err := applyQueryOne(ctx, src, descriptor)
+			state.setProducedOrRaiseDefault(pc, dst, out, err)
+		case bytecode.OpDataSet:
+			state.writeBorrowedRegister(dst, data.NewDataSet(src1 == 1))
+		case bytecode.OpDataSetCollector:
+			collectorType := bytecode.CollectorType(src1)
+
+			if collectorType == bytecode.CollectorTypeAggregate || collectorType == bytecode.CollectorTypeAggregateGroup {
+				planIdx := int(src2)
+
+				if planIdx < 0 || planIdx >= len(aggregatePlans) {
+					invariantErr := diagnostics.NewInvariantError(
+						"invalid aggregate plan index",
+						runtime.Errorf(runtime.ErrUnexpected, "invalid aggregate plan index %d", planIdx),
+					)
+					state.raiseInvariantAt(pc, invariantErr)
+
+					break
+				}
+
+				plan := aggregatePlans[planIdx]
+
+				if collectorType == bytecode.CollectorTypeAggregate {
+					state.writeProducedRegister(dst, data.NewAggregateCollector(plan))
+				} else {
+					state.writeProducedRegister(dst, data.NewGroupedAggregateCollector(plan))
+				}
+
+				continue
+			}
+
+			collector, err := data.NewCollectorSafe(collectorType)
+			if err != nil {
+				invariantErr := diagnostics.NewInvariantError("invalid collector configuration", err)
+				state.raiseInvariantAt(pc, invariantErr)
+
+				break
+			}
+
+			state.writeProducedRegister(dst, collector)
+		case bytecode.OpDataSetSorter:
+			state.writeProducedRegister(dst, data.NewSorter(runtime.SortDirection(src1)))
+		case bytecode.OpDataSetMultiSorter:
+			encoded := src1.Register()
+			count := src2.Register()
+
+			state.writeProducedRegister(dst, data.NewMultiSorter(runtime.DecodeSortDirections(encoded, count)))
+		case bytecode.OpFlatten:
+			depth := src2.Register()
+
+			if depth < 1 {
+				depth = 1
+			}
+
+			res, err := arrayFlatten(ctx, reg[src1], depth)
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpDistinct:
+			res, err := arrayDistinct(ctx, reg[src1])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpAdd:
+			res, err := runtime.Add(ctx, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpAddConst:
+			res, err := runtime.Add(ctx, reg[src1], constants[src2.Constant()])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpConcat:
+			res, err := concatStrings(reg, src1, src2)
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpSub:
+			res, err := runtime.Subtract(ctx, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpMul:
+			res, err := runtime.Multiply(ctx, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpDiv:
+			res, err := runtime.Divide(ctx, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpMod:
+			res, err := runtime.Mod(ctx, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpIncr:
+			res, err := runtime.Increment(ctx, reg[dst])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpDecr:
+			res, err := runtime.Decrement(ctx, reg[dst])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpNegate:
+			res, err := runtime.Negative(reg[src1])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpFlipPositive:
+			res, err := runtime.Positive(reg[src1])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpFlipNegative:
+			res, err := runtime.Negative(reg[src1])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpCastBool:
+			reg[dst] = coerceBool(reg[src1])
+		case bytecode.OpCmp:
+			res, err := runtime.CompareValues(ctx, reg[src2], reg[src1])
+			state.setOrRaiseDefault(pc, dst, runtime.Int(res), err)
+		case bytecode.OpNot:
+			res, err := runtime.Not(reg[src1])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpEq:
+			res, err := runtime.EvaluateComparison(ctx, operator.Equal, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpNe:
+			res, err := runtime.EvaluateComparison(ctx, operator.NotEqual, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpGt:
+			res, err := runtime.EvaluateComparison(ctx, operator.Greater, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpLt:
+			res, err := runtime.EvaluateComparison(ctx, operator.Less, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpGte:
+			res, err := runtime.EvaluateComparison(ctx, operator.GreaterOrEqual, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpLte:
+			res, err := runtime.EvaluateComparison(ctx, operator.LessOrEqual, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpIn:
+			res, err := runtime.EvaluateComparison(ctx, operator.In, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpLike:
+			res, err := Like(reg[src1], reg[src2])
+
+			if err == nil {
+				reg[dst] = res
+				break
+			}
+
+			state.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.False, true)
+		case bytecode.OpRegexp:
+			r, err := vm.regexpCached(pc, reg[src2])
+
+			if err == nil {
+				reg[dst] = r.Match(reg[src1])
+				continue
+			}
+
+			state.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.False, true)
+		case bytecode.OpExists:
+			val := reg[src1]
+
+			if val == runtime.None {
+				reg[dst] = runtime.False
+				continue
+			}
+
+			if measurable, ok := val.(runtime.Measurable); ok {
+				length, err := measurable.Length(ctx)
+
+				if err != nil {
+					state.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.False, true)
+					break
+				}
+
+				reg[dst] = runtime.NewBoolean(length != 0)
+
+				continue
+			}
+
+			reg[dst] = runtime.True
+		case bytecode.OpAllEq, bytecode.OpAllNe, bytecode.OpAllGt, bytecode.OpAllGte, bytecode.OpAllLt, bytecode.OpAllLte, bytecode.OpAllIn:
+			cmp, ok := operator.ArrayComparatorFromOffset(int(op) - int(bytecode.OpAllEq))
+			if !ok {
+				state.raiseInvariantAt(pc, runtime.Errorf(runtime.ErrInvalidOperation, "invalid ALL comparison opcode %s", op))
+				break
+			}
+
+			res, err := arrayAll(ctx, cmp, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpAnyEq, bytecode.OpAnyNe, bytecode.OpAnyGt, bytecode.OpAnyGte, bytecode.OpAnyLt, bytecode.OpAnyLte, bytecode.OpAnyIn:
+			cmp, ok := operator.ArrayComparatorFromOffset(int(op) - int(bytecode.OpAnyEq))
+			if !ok {
+				state.raiseInvariantAt(pc, runtime.Errorf(runtime.ErrInvalidOperation, "invalid ANY comparison opcode %s", op))
+				break
+			}
+
+			res, err := arrayAny(ctx, cmp, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpNoneEq, bytecode.OpNoneNe, bytecode.OpNoneGt, bytecode.OpNoneGte, bytecode.OpNoneLt, bytecode.OpNoneLte, bytecode.OpNoneIn:
+			cmp, ok := operator.ArrayComparatorFromOffset(int(op) - int(bytecode.OpNoneEq))
+			if !ok {
+				state.raiseInvariantAt(pc, runtime.Errorf(runtime.ErrInvalidOperation, "invalid NONE comparison opcode %s", op))
+				break
+			}
+
+			res, err := arrayNone(ctx, cmp, reg[src1], reg[src2])
+			state.setOrRaiseDefault(pc, dst, res, err)
+		case bytecode.OpLength:
+			val, ok := reg[src1].(runtime.Measurable)
+
+			if ok {
+				length, err := val.Length(ctx)
+				if err != nil {
+					state.raiseRuntimeAt(pc, err, recoverDefault, dst, runtime.ZeroInt, true)
+					break
+				}
+
+				reg[dst] = length
+
+				continue
+			}
+
+			callErr := runtime.TypeErrorOf(reg[src1],
+				runtime.TypeString,
+				runtime.TypeList,
+				runtime.TypeMap,
+				runtime.TypeBinary,
+				runtime.TypeMeasurable,
+			)
+			state.raiseRuntimeAt(pc, callErr, recoverDefault, dst, runtime.ZeroInt, true)
+		case bytecode.OpType:
+			state.writeBorrowedRegister(dst, runtime.NewString(runtime.TypeName(runtime.TypeOf(reg[src1]))))
+		case bytecode.OpClose:
+			if err := cancellation.Check(); err != nil {
+				return nil, sourcePointContinue, err
+			}
+
+			val := reg[dst]
+			if key, _, ok := mem.ResourceKeyOf(val); ok {
+				state.aliases.Delete(key)
+			}
+
+			closer, ok := state.owned.Release(val)
+			if !ok {
+				closer, ok = val.(io.Closer)
+			}
+
+			state.writeBorrowedRegister(dst, runtime.None)
+
+			if ok {
+				closeErr := closer.Close()
+
+				if closeErr != nil {
+					state.raiseRuntimeAt(pc, closeErr, recoverDefault, bytecode.NoopOperand, nil, false)
+				}
+			}
+		case bytecode.OpSleep:
+			dur, err := runtime.ToDuration(ctx, reg[dst])
+
+			if err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if dur < 0 {
+				state.raiseRuntimeAt(pc, runtime.Error(runtime.ErrInvalidArgument, "wait duration must not be negative"), recoverDefault, bytecode.NoopOperand, nil, false)
+				break
+			}
+
+			if err := data.Sleep(ctx, dur); err != nil {
+				state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+			}
+		case bytecode.OpRand:
+			src, ok := rnd.FromContext(ctx)
+			if !ok {
+				state.raiseRuntimeAt(pc, runtime.Error(runtime.ErrUnexpected, "random source missing from execution context"), recoverDefault, bytecode.NoopOperand, nil, false)
+
+				break
+			}
+
+			state.writeBorrowedRegister(dst, runtime.NewFloat(src.Float64()))
+		case bytecode.OpElapsed:
+			state.writeBorrowedRegister(dst, state.elapsed())
+		default:
+			return nil, sourcePointContinue, runtime.Errorf(runtime.ErrUnexpected, "unknown opcode %d at pc %d", op, pc)
+		}
+
+		// Sticky checkpoint: opcode branches only raise failures; resolution happens here.
+		if state.hasFail {
+			if isExecutionCancellation(state.failure.err) {
+				return nil, sourcePointContinue, state.failure.err
+			}
+
+			if state.resolveFailure() == errReturn {
+				return nil, sourcePointContinue, state.failure.err
+			}
+
+			continue
+		}
+	}
+
+	if err := cancellation.Check(); err != nil {
+		return nil, sourcePointContinue, err
+	}
+
+	return state.registers[bytecode.NoopOperand], sourcePointContinue, nil
+}
+
+func (vm *VM) regexpCached(pc int, value runtime.Value) (*runtime.Regexp, error) {
+	// We compare patterns to ensure that the cached regexp is the same as the one we're trying to use.
+	// This is necessary because the same compiled function can be used in different places with different regexps,
+	// and we want to avoid caching a regexp that doesn't match the current pattern.
+	switch v := value.(type) {
+	case *runtime.Regexp:
+		pattern := v.String()
+
+		if cached := vm.cache.Regexps[pc]; cached == nil || cached.Pattern != pattern {
+			vm.cache.Regexps[pc] = &mem.CachedRegexp{Pattern: pattern, Regexp: v}
+		}
+
+		return v, nil
+	case runtime.String:
+		pattern := v.String()
+
+		if cached := vm.cache.Regexps[pc]; cached != nil && cached.Pattern == pattern {
+			return cached.Regexp, nil
+		}
+
+		r, err := runtime.NewRegexp(v.String())
+		if err != nil {
+			return nil, err
+		}
+
+		vm.cache.Regexps[pc] = &mem.CachedRegexp{Pattern: pattern, Regexp: r}
+
+		return r, nil
+	default:
+		return nil, runtime.TypeErrorOf(value, runtime.TypeString, runtime.TypeRegexp)
+	}
+}
+
+func (vm *VM) loadFastKeyCached(
+	ctx context.Context,
+	pc int,
+	inst *execInstruction,
+	obj *data.FastObject,
+	arg runtime.Value,
+	key string,
+	constKey bool,
+) (runtime.Value, error) {
+	shapeID := obj.ShapeID()
+	if shapeID == 0 {
+		return vm.loadKey(ctx, obj, arg)
+	}
+
+	if constKey {
+		if inst != nil && inst.InlineShapeID == shapeID {
+			if inst.InlineSlot < 0 {
+				return runtime.None, nil
+			}
+
+			if val, ok := obj.SlotValue(inst.InlineSlot); ok {
+				return val, nil
+			}
+
+			return runtime.None, nil
+		}
+
+		if pc < 0 || pc >= len(vm.cache.LoadKeyConstICs) {
+			return vm.loadKey(ctx, obj, arg)
+		}
+
+		cache := vm.cache.LoadKeyConstICs[pc]
+		if cache != nil {
+			if slot, ok := cache.Lookup(shapeID); ok {
+				if inst != nil {
+					inst.InlineShapeID = shapeID
+					inst.InlineSlot = slot
+				}
+
+				if slot < 0 {
+					return runtime.None, nil
+				}
+
+				if val, ok := obj.SlotValue(slot); ok {
+					return val, nil
+				}
+
+				return runtime.None, nil
+			}
+		}
+
+		slot, ok := obj.LookupSlot(key)
+		if !ok {
+			if cache == nil {
+				cache = mem.NewLoadKeyConstCache()
+				vm.cache.LoadKeyConstICs[pc] = cache
+			}
+
+			cache.Add(shapeID, -1)
+
+			if inst != nil {
+				inst.InlineShapeID = shapeID
+				inst.InlineSlot = -1
+			}
+
+			return runtime.None, nil
+		}
+
+		val, ok := obj.SlotValue(slot)
+		if !ok {
+			return runtime.None, nil
+		}
+
+		if cache == nil {
+			cache = mem.NewLoadKeyConstCache()
+			vm.cache.LoadKeyConstICs[pc] = cache
+		}
+
+		cache.Add(shapeID, slot)
+
+		if inst != nil {
+			inst.InlineShapeID = shapeID
+			inst.InlineSlot = slot
+		}
+
+		return val, nil
+	}
+
+	if pc < 0 || pc >= len(vm.cache.LoadKeyICs) {
+		return vm.loadKey(ctx, obj, arg)
+	}
+
+	cache := vm.cache.LoadKeyICs[pc]
+	if cache != nil {
+		if slot, ok := cache.Lookup(shapeID, key); ok {
+			if slot < 0 {
+				return runtime.None, nil
+			}
+
+			if val, ok := obj.SlotValue(slot); ok {
+				return val, nil
+			}
+
+			return runtime.None, nil
+		}
+	}
+
+	slot, ok := obj.LookupSlot(key)
+	if !ok {
+		if cache == nil {
+			cache = mem.NewLoadKeyCache()
+			vm.cache.LoadKeyICs[pc] = cache
+		}
+
+		cache.Add(shapeID, key, -1)
+
+		return runtime.None, nil
+	}
+
+	val, ok := obj.SlotValue(slot)
+	if !ok {
+		return runtime.None, nil
+	}
+
+	if cache == nil {
+		cache = mem.NewLoadKeyCache()
+		vm.cache.LoadKeyICs[pc] = cache
+	}
+
+	cache.Add(shapeID, key, slot)
+
+	return val, nil
+}
+
+func (vm *VM) loadKeyCached(ctx context.Context, pc int, src, arg runtime.Value) (runtime.Value, error) {
+	obj, ok := src.(*data.FastObject)
+	if !ok {
+		return vm.loadKey(ctx, src, arg)
+	}
+
+	var key string
+
+	switch v := arg.(type) {
+	case runtime.String:
+		key = string(v)
+	default:
+		key = runtime.ToString(v).String()
+	}
+
+	return vm.loadFastKeyCached(ctx, pc, nil, obj, arg, key, false)
+}
+
+func (vm *VM) loadKeyConstCached(ctx context.Context, pc int, inst *execInstruction, src, arg runtime.Value) (runtime.Value, error) {
+	obj, ok := src.(*data.FastObject)
+	if !ok {
+		return vm.loadKey(ctx, src, arg)
+	}
+
+	var key string
+
+	switch v := arg.(type) {
+	case runtime.String:
+		key = string(v)
+	default:
+		key = runtime.ToString(v).String()
+	}
+
+	return vm.loadFastKeyCached(ctx, pc, inst, obj, arg, key, true)
+}
+
+func (vm *VM) objectSetConstCached(inst *execInstruction, obj *data.FastObject, key runtime.String, value runtime.Value) {
+	if obj == nil {
+		return
+	}
+
+	if inst != nil {
+		shape := obj.Shape()
+
+		if shape != nil && inst.InlineSetShape == shape {
+			if obj.SetSlotWithShape(inst.InlineSetNextShape, inst.InlineSlot, value) {
+				return
+			}
+		}
+	}
+
+	prev, next, slot, ok := obj.SetStringCached(string(key), value)
+	if ok && inst != nil {
+		inst.InlineSetShape = prev
+		inst.InlineSetNextShape = next
+		inst.InlineSlot = slot
+	}
+}
+
+func (vm *VM) loadIndex(ctx context.Context, src, arg runtime.Value) (runtime.Value, error) {
+	indexed, ok := src.(runtime.IndexReadable)
+	if !ok {
+		return nil, diagnostics.MemberAccessErrorOf(src, diagnostics.MemberAccessIndex, arg)
+	}
+
+	var idx runtime.Int
+	var err error
+
+	switch v := arg.(type) {
+	case runtime.Int:
+		idx = v
+	case runtime.Float:
+		// Convert float to int, rounding down
+		idx = runtime.Int(v)
+	default:
+		err = runtime.TypeErrorOf(arg, runtime.TypeInt, runtime.TypeFloat)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return indexed.At(ctx, idx)
+}
+
+func (vm *VM) loadKey(ctx context.Context, src, arg runtime.Value) (runtime.Value, error) {
+	keyed, ok := src.(runtime.KeyReadable)
+	if !ok {
+		return nil, diagnostics.MemberAccessErrorOf(src, diagnostics.MemberAccessProperty, arg)
+	}
+
+	out, err := keyed.Get(ctx, arg)
+	if err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+func (vm *VM) loadIndexAndSet(ctx context.Context, dst bytecode.Operand, pc int, src, arg runtime.Value, optional bool) {
+	state := &vm.state
+
+	if optional && src == runtime.None {
+		state.writeBorrowedRegister(dst, runtime.None)
+
+		return
+	}
+
+	out, err := vm.loadIndex(ctx, src, arg)
+	state.setOrOptional(pc, dst, out, err, optional)
+}
+
+func (vm *VM) loadKeyAndSet(ctx context.Context, dst bytecode.Operand, pc int, src, arg runtime.Value, optional bool) {
+	state := &vm.state
+
+	if optional && src == runtime.None {
+		state.writeBorrowedRegister(dst, runtime.None)
+
+		return
+	}
+
+	out, err := vm.loadKeyCached(ctx, pc, src, arg)
+	state.setOrOptional(pc, dst, out, err, optional)
+}
+
+func (vm *VM) loadKeyConstAndSet(ctx context.Context, dst bytecode.Operand, pc int, inst *execInstruction, src, arg runtime.Value, optional bool) {
+	state := &vm.state
+
+	if optional && src == runtime.None {
+		state.writeBorrowedRegister(dst, runtime.None)
+
+		return
+	}
+
+	out, err := vm.loadKeyConstCached(ctx, pc, inst, src, arg)
+	state.setOrOptional(pc, dst, out, err, optional)
+}
+
+func (vm *VM) matchLoadPropertyConst(ctx context.Context, pc int, inst *execInstruction, dst bytecode.Operand, src runtime.Value, key runtime.String) bool {
+	state := &vm.state
+
+	switch obj := src.(type) {
+	case *runtime.Object:
+		out, found, err := obj.Lookup(ctx, key)
+		if err != nil {
+			state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+			return false
+		}
+
+		if !found {
+			state.pc = inst.InlineSlot
+
+			return true
+		}
+
+		state.writeBorrowedRegister(dst, out)
+
+		return false
+	case *data.FastObject:
+		out, found, err := obj.Lookup(ctx, key)
+		if err != nil {
+			state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+			return false
+		}
+
+		if !found {
+			state.pc = inst.InlineSlot
+
+			return true
+		}
+
+		state.writeBorrowedRegister(dst, out)
+
+		return false
+	case runtime.Map:
+		has, err := obj.ContainsKey(ctx, key)
+		if err != nil {
+			state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+			return false
+		}
+
+		if !has {
+			state.pc = inst.InlineSlot
+
+			return true
+		}
+
+		out, err := obj.Get(ctx, key)
+		if err != nil {
+			state.raiseRuntimeAt(pc, err, recoverDefault, bytecode.NoopOperand, nil, false)
+
+			return false
+		}
+
+		state.writeBorrowedRegister(dst, out)
+
+		return false
+	default:
+		state.pc = inst.InlineSlot
+
+		return true
+	}
+}
+
+func (vm *VM) loadPropertyAndSet(ctx context.Context, dst bytecode.Operand, pc int, src, prop runtime.Value, optional bool) {
+	state := &vm.state
+
+	if optional && src == runtime.None {
+		state.writeBorrowedRegister(dst, runtime.None)
+
+		return
+	}
+
+	var out runtime.Value
+	var err error
+
+	switch getter := prop.(type) {
+	case runtime.String:
+		out, err = vm.loadKeyCached(ctx, pc, src, getter)
+	case runtime.Float, runtime.Int:
+		out, err = vm.loadIndex(ctx, src, getter)
+	default:
+		out, err = vm.loadKeyCached(ctx, pc, src, runtime.ToString(prop))
+	}
+
+	state.setOrOptional(pc, dst, out, err, optional)
+}
+
+func (vm *VM) loadPropertyConstAndSet(ctx context.Context, dst bytecode.Operand, pc int, inst *execInstruction, src, prop runtime.Value, optional bool) {
+	state := &vm.state
+
+	if optional && src == runtime.None {
+		state.writeBorrowedRegister(dst, runtime.None)
+
+		return
+	}
+
+	var out runtime.Value
+	var err error
+
+	switch getter := prop.(type) {
+	case runtime.String:
+		out, err = vm.loadKeyConstCached(ctx, pc, inst, src, getter)
+	case runtime.Float, runtime.Int:
+		out, err = vm.loadIndex(ctx, src, getter)
+	default:
+		out, err = vm.loadKeyConstCached(ctx, pc, inst, src, runtime.ToString(prop))
+	}
+
+	state.setOrOptional(pc, dst, out, err, optional)
+}

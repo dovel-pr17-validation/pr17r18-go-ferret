@@ -1,0 +1,478 @@
+package bytecode
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+)
+
+func TestValidateProgram(t *testing.T) {
+	tests := []struct {
+		target  error
+		program *Program
+		name    string
+	}{
+		{
+			name:    "unknown_opcode",
+			program: withProgramMutation(func(program *Program) { program.Bytecode[0] = NewInstruction(Opcode(255)) }),
+			target:  ErrInvalidInstruction,
+		},
+		{
+			name:    "register_out_of_range",
+			program: withProgramMutation(func(program *Program) { program.Bytecode[0] = NewInstruction(OpReturn, NewRegister(3)) }),
+			target:  ErrInvalidInstruction,
+		},
+		{
+			name:    "elapsed_register_out_of_range",
+			program: withProgramMutation(func(program *Program) { program.Bytecode[0] = NewInstruction(OpElapsed, NewRegister(3)) }),
+			target:  ErrInvalidInstruction,
+		},
+		{
+			name: "stream_group_register_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpStreamGroup, NewRegister(0), NewRegister(1), NewRegister(3))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "stream_group_arm_done_register_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpStreamGroupArmDone, NewRegister(0), NewRegister(3))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "destructure_register_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpAssertDestructure, NewRegister(3), Operand(DestructureModeObject))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "destructure_invalid_mode",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpAssertDestructure, NewRegister(0), Operand(99))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "destructure_unexpected_third_operand",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpAssertDestructure, NewRegister(0), Operand(DestructureModeObject), Operand(1))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "array_spread_destination_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpArraySpread, NewRegister(3), NewRegister(0))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "object_spread_source_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpObjectSpread, NewRegister(0), NewRegister(3))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "array_spread_unexpected_third_operand",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpArraySpread, NewRegister(0), NewRegister(1), Operand(1))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "constant_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpLoadConst, NewRegister(0), NewConstant(99))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name:    "jump_target_out_of_range",
+			program: withProgramMutation(func(program *Program) { program.Bytecode[0] = NewInstruction(OpJump, Operand(99)) }),
+			target:  ErrInvalidInstruction,
+		},
+		{
+			name: "invalid_catch_entry",
+			program: withProgramMutation(func(program *Program) {
+				program.CatchTable = []Catch{{1, 0, 1}}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "invalid_aggregate_metadata",
+			program: withProgramMutation(func(program *Program) {
+				program.Metadata.AggregateSelectorSlots = []int{-2, -1}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "invalid_call_argument_span_metadata",
+			program: withProgramMutation(func(program *Program) {
+				program.Metadata.CallArgumentSpans = [][]source.Span{
+					{{Start: 0, End: 1}},
+				}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "empty_host_function_name",
+			program: withProgramMutation(func(program *Program) {
+				program.Functions.Host = []HostFunction{{Name: "", ArgCount: 0}}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "negative_host_function_argument_count",
+			program: withProgramMutation(func(program *Program) {
+				program.Functions.Host = []HostFunction{{Name: "FN", ArgCount: -1}}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "duplicate_host_function_signature",
+			program: withProgramMutation(func(program *Program) {
+				program.Functions.Host = []HostFunction{
+					{Name: "DB::POSTGRES::FN", ArgCount: 1},
+					{Name: "db::postgres::fn", ArgCount: 1},
+				}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "empty_namespaced_host_function_name",
+			program: withProgramMutation(func(program *Program) {
+				program.Functions.Host = []HostFunction{{Name: "TEST::", ArgCount: 0}}
+			}),
+			target: ErrInvalidProgram,
+		},
+		{
+			name: "required_constant_type_check",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpFail, NewConstant(0))
+				program.Constants[0] = runtime.NewInt(1)
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "array_preallocation_too_large",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpLoadArray, NewRegister(0), Operand(MaxCollectionPreallocation+1))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "object_preallocation_too_large",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpLoadObject, NewRegister(0), Operand(MaxCollectionPreallocation+1))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "multi_sorter_direction_count_too_large",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpDataSetMultiSorter, NewRegister(0), Operand(0), Operand(MaxEncodedSortDirections+1))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "concat_register_range_out_of_bounds",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpConcat, NewRegister(0), NewRegister(2), Operand(2))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "delete_key_register_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpDeleteKey, NewRegister(0), NewRegister(3))
+			}),
+			target: ErrInvalidInstruction,
+		},
+		{
+			name: "delete_key_const_out_of_range",
+			program: withProgramMutation(func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpDeleteKeyConst, NewRegister(0), NewConstant(99))
+			}),
+			target: ErrInvalidInstruction,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateProgram(tc.program)
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("expected %v, got %v", tc.target, err)
+			}
+		})
+	}
+}
+
+func TestValidateProgramAllowsMaxEncodedSortDirections(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode[0] = NewInstruction(
+			OpDataSetMultiSorter,
+			NewRegister(0),
+			Operand(1<<(MaxEncodedSortDirections-1)),
+			Operand(MaxEncodedSortDirections),
+		)
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected max encoded sort direction count to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsConcatImmediateCountAtRegisterLimit(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode[0] = NewInstruction(OpConcat, NewRegister(0), NewRegister(0), Operand(program.Registers))
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected concat immediate count at register limit to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsDeleteOpcodes(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode = []Instruction{
+			NewInstruction(OpLoadObject, NewRegister(0), Operand(0)),
+			NewInstruction(OpLoadConst, NewRegister(1), NewConstant(0)),
+			NewInstruction(OpDeleteKey, NewRegister(0), NewRegister(1)),
+			NewInstruction(OpDeleteKeyConst, NewRegister(0), NewConstant(0)),
+			NewInstruction(OpDeleteProperty, NewRegister(0), NewRegister(1)),
+			NewInstruction(OpDeletePropertyConst, NewRegister(0), NewConstant(0)),
+			NewInstruction(OpReturn, NewRegister(0)),
+		}
+		program.Metadata.Labels = nil
+		program.Metadata.AggregateSelectorSlots = nil
+		program.Metadata.MatchFailTargets = nil
+		program.Metadata.DebugSpans = nil
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected delete opcodes to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsDistinctOpcode(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode = []Instruction{
+			NewInstruction(OpLoadArray, NewRegister(0), Operand(0)),
+			NewInstruction(OpDistinct, NewRegister(1), NewRegister(0)),
+			NewInstruction(OpReturn, NewRegister(1)),
+		}
+		program.Metadata.Labels = nil
+		program.Metadata.AggregateSelectorSlots = nil
+		program.Metadata.MatchFailTargets = nil
+		program.Metadata.DebugSpans = nil
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected distinct opcode to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsElapsedOpcode(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode = []Instruction{
+			NewInstruction(OpElapsed, NewRegister(0)),
+			NewInstruction(OpReturn, NewRegister(0)),
+		}
+		program.Metadata.Labels = nil
+		program.Metadata.AggregateSelectorSlots = nil
+		program.Metadata.MatchFailTargets = nil
+		program.Metadata.DebugSpans = nil
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected elapsed opcode to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsStreamGroupOpcodes(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode = []Instruction{
+			NewInstruction(OpStreamGroup, NewRegister(0), NewRegister(1), NewRegister(2)),
+			NewInstruction(OpStreamGroupArmDone, NewRegister(0), NewRegister(1)),
+			NewInstruction(OpReturn, NewRegister(0)),
+		}
+		program.Metadata.Labels = nil
+		program.Metadata.AggregateSelectorSlots = nil
+		program.Metadata.MatchFailTargets = nil
+		program.Metadata.DebugSpans = nil
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected stream group opcodes to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsDestructureAssertions(t *testing.T) {
+	program := withProgramMutation(func(program *Program) {
+		program.Bytecode = []Instruction{
+			NewInstruction(OpAssertDestructure, NewRegister(0), Operand(DestructureModeObject)),
+			NewInstruction(OpAssertDestructure, NewRegister(0), Operand(DestructureModeArray)),
+			NewInstruction(OpReturn, NewRegister(0)),
+		}
+		program.Metadata.Labels = nil
+		program.Metadata.AggregateSelectorSlots = nil
+		program.Metadata.MatchFailTargets = nil
+		program.Metadata.DebugSpans = nil
+	})
+
+	if err := ValidateProgram(program); err != nil {
+		t.Fatalf("expected destructure assertions to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramAllowsSourcePoints(t *testing.T) {
+	if err := ValidateProgram(validSourcePointProgram()); err != nil {
+		t.Fatalf("expected source point program to be valid, got %v", err)
+	}
+}
+
+func TestValidateProgramRejectsInvalidSourcePointMapping(t *testing.T) {
+	tests := []struct {
+		mutate func(*Program)
+		name   string
+	}{
+		{
+			name: "debug_point_does_not_reference_source_point",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints[0].PC = 1
+			},
+		},
+		{
+			name: "source_point_id_out_of_range",
+			mutate: func(program *Program) {
+				program.Bytecode[0] = NewInstruction(OpSourcePoint, Operand(1))
+			},
+		},
+		{
+			name: "source_point_without_debug_point",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints = nil
+			},
+		},
+		{
+			name: "negative_debug_point_id",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints[0].ID = -1
+			},
+		},
+		{
+			name: "duplicate_debug_point_id",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints[1].ID = program.Metadata.DebugPoints[0].ID
+				program.Bytecode[2] = NewInstruction(OpSourcePoint, Operand(program.Metadata.DebugPoints[0].ID))
+			},
+		},
+		{
+			name: "invalid_debug_point_kind",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints[0].Kind = DebugPointSynthetic + 1
+			},
+		},
+		{
+			name: "debug_point_function_id_below_sentinel",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints[0].FunctionID = NoFunction - 1
+			},
+		},
+		{
+			name: "debug_point_function_id_upper_bound",
+			mutate: func(program *Program) {
+				program.Metadata.DebugPoints[0].FunctionID = FunctionID(len(program.Functions.UserDefined))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			program := validSourcePointProgram()
+			tc.mutate(program)
+
+			if err := ValidateProgram(program); !errors.Is(err, ErrInvalidProgram) {
+				t.Fatalf("expected invalid program, got %v", err)
+			}
+		})
+	}
+}
+
+func validValidationProgram() *Program {
+	return &Program{
+		Source: source.New("validation.fql", "RETURN 1"),
+		Functions: Functions{
+			Host: []HostFunction{
+				{Name: "now", ArgCount: 0},
+			},
+			UserDefined: []UDF{
+				{
+					Name:        "main",
+					DisplayName: "main",
+					Entry:       1,
+					Registers:   1,
+					Params:      0,
+				},
+			},
+		},
+		Bytecode: []Instruction{
+			NewInstruction(OpLoadConst, NewRegister(0), NewConstant(0)),
+			NewInstruction(OpReturn, NewRegister(0)),
+		},
+		Constants: []runtime.Value{
+			runtime.NewString("ok"),
+		},
+		CatchTable: nil,
+		Params:     []string{"input"},
+		Metadata: Metadata{
+			Labels:                 map[int]string{1: "exit"},
+			CompilerVersion:        "test",
+			AggregatePlans:         []AggregatePlan{NewAggregatePlan([]runtime.String{runtime.NewString("group")}, []AggregateKind{AggregateCount}, false)},
+			AggregateSelectorSlots: []int{-1, -1},
+			CallArgumentSpans:      nil,
+			MatchFailTargets:       []int{-1, -1},
+			DebugSpans:             []source.Span{{Start: 0, End: 6}, {Start: 7, End: 8}},
+			OptimizationLevel:      1,
+		},
+		ISAVersion: Version,
+		Registers:  3,
+	}
+}
+
+func validSourcePointProgram() *Program {
+	program := validValidationProgram()
+	program.Bytecode = []Instruction{
+		NewInstruction(OpSourcePoint, Operand(9)),
+		NewInstruction(OpLoadConst, NewRegister(0), NewConstant(0)),
+		NewInstruction(OpSourcePoint, Operand(3)),
+		NewInstruction(OpReturn, NewRegister(0)),
+	}
+	program.Functions.UserDefined[0].Entry = 1
+	program.Metadata.Labels = nil
+	program.Metadata.AggregateSelectorSlots = nil
+	program.Metadata.MatchFailTargets = nil
+	program.Metadata.DebugSpans = nil
+	program.Metadata.DebugPoints = []DebugPoint{
+		{ID: 9, PC: 0, Span: source.Span{Start: 0, End: 6}, FunctionID: NoFunction},
+		{ID: 3, PC: 2, Span: source.Span{Start: 7, End: 8}, FunctionID: NoFunction},
+	}
+
+	return program
+}
+
+func withProgramMutation(mutate func(program *Program)) *Program {
+	program := validValidationProgram()
+
+	if mutate != nil {
+		mutate(program)
+	}
+
+	return program
+}

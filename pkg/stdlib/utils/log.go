@@ -1,0 +1,34 @@
+package utils
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/logging"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// print writes messages into the system log.
+// @param message {Any, repeated} Message to print.
+// @return {None} None.
+func Print(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+	err := runtime.ValidateArgs(args, 1, runtime.MaxArgs)
+
+	if err != nil {
+		return runtime.None, err
+	}
+
+	messages := make([]interface{}, 0, len(args))
+
+	for idx, input := range args {
+		if idx == 0 {
+			messages = append(messages, input)
+		} else {
+			messages = append(messages, " "+input.String())
+		}
+	}
+
+	logger := logging.From(ctx)
+	logger.Print(messages...)
+
+	return runtime.None, nil
+}

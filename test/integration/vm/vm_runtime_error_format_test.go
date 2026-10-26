@@ -1,0 +1,720 @@
+package vm_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/compiler"
+	pkgdiagnostics "github.com/MontFerret/ferret/v2/pkg/diagnostics"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+	"github.com/MontFerret/ferret/v2/pkg/stdlib"
+	"github.com/MontFerret/ferret/v2/pkg/vm"
+	"github.com/MontFerret/ferret/v2/test/spec"
+	. "github.com/MontFerret/ferret/v2/test/spec/exec"
+)
+
+func TestRuntimeErrorFormatting(t *testing.T) {
+	RunSpecs(t, []spec.Spec{
+		spec.NewSpec(
+			"LET numerator = 10\nRETURN numerator / 0",
+			"script.fql",
+		).Expect().ExecError(ShouldBeRuntimeError, &ExpectedRuntimeError{
+			Message: "division by zero",
+			Contains: []string{
+				"DivideByZero: division by zero",
+				":2:8",
+				"attempt to divide by zero",
+				"Hint: Ensure the denominator is non-zero before division",
+			},
+			NotContains: []string{"~"},
+		}),
+		spec.NewSpec(
+			"LET obj = {}\nRETURN obj.foo.bar",
+			"obj.fql",
+		).Expect().ExecError(ShouldBeRuntimeError, &ExpectedRuntimeError{
+			Message: "invalid type",
+			Contains: []string{
+				"TypeError: invalid type",
+				"property \"bar\" cannot be read from this value",
+				"Note: cannot read property \"bar\" of None",
+				"Hint: Use optional chaining (?.) or check for None before accessing a member",
+				"Caused by: invalid type",
+			},
+		}),
+		spec.NewSpec(
+			"LET value = 1\nvalue.foo = 2\nRETURN value",
+			"mutation.fql",
+		).Expect().ExecError(ShouldBeRuntimeError, &ExpectedRuntimeError{
+			Message: "invalid type",
+			Contains: []string{
+				"TypeError: invalid type",
+				"property \"foo\" cannot be written to this value",
+				"Note: cannot write property \"foo\" of Int",
+				"Hint: Ensure the value supports property writes (for example, a mutable object)",
+				"Caused by: invalid type",
+			},
+		}),
+		spec.NewSpec(
+			"LET value = 1\nDELETE value.foo\nRETURN value",
+			"deletion.fql",
+		).Expect().ExecError(ShouldBeRuntimeError, &ExpectedRuntimeError{
+			Message: "invalid type",
+			Contains: []string{
+				"TypeError: invalid type",
+				"property \"foo\" cannot be deleted from this value",
+				"Note: cannot delete property \"foo\" from Int",
+				"Hint: Ensure the value supports property deletion (for example, a mutable object)",
+				"Caused by: invalid type",
+			},
+		}),
+	})
+}
+
+func TestRuntimeErrorTailCallFormatting(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Basic, compiler.Full} {
+		stack := []string{"called from Inner (#1)", "VM stack: Inner"}
+		if level == compiler.None {
+			stack = []string{"called from Inner (#1)", "called from Outer (#2)", "VM stack: Outer -> Inner"}
+		}
+
+		RunSpecsWith(t, level.String(), mustNewCompiler(t, compiler.WithOptimizationLevel(level)), []spec.Spec{
+			spec.NewSpec(
+				`
+FUNC Inner() => FAIL()
+FUNC Outer() {
+  LET result = Inner()
+  RETURN result
+}
+RETURN Outer()
+`,
+				"nested_udf_stack.fql",
+			).Expect().ExecError(ShouldBeRuntimeError, &ExpectedRuntimeError{
+				Contains: stack,
+			}).Env(
+				vm.WithFunction("FAIL", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+					return runtime.None, errors.New("boom")
+				}),
+			),
+		})
+	}
+}
+
+func TestZeroDivisorDiagnosticsUseRuntimeOperationIdentity(t *testing.T) {
+	if vm.ErrDivisionByZero != runtime.ErrDivisionByZero {
+		t.Fatal("vm.ErrDivisionByZero is not an alias of runtime.ErrDivisionByZero")
+	}
+	if vm.ErrModuloByZero != runtime.ErrModuloByZero {
+		t.Fatal("vm.ErrModuloByZero is not an alias of runtime.ErrModuloByZero")
+	}
+
+	tests := []struct {
+		identity error
+		kind     pkgdiagnostics.Kind
+		query    string
+		message  string
+		label    string
+		hint     string
+		name     string
+	}{
+		{name: "Int division", query: "RETURN 1 / 0", identity: vm.ErrDivisionByZero, kind: vm.DivideByZero, message: "division by zero", label: "attempt to divide by zero", hint: "Ensure the denominator is non-zero before division"},
+		{name: "Float division", query: "RETURN 1.0 / 0.0", identity: vm.ErrDivisionByZero, kind: vm.DivideByZero, message: "division by zero", label: "attempt to divide by zero", hint: "Ensure the denominator is non-zero before division"},
+		{name: "Duration scalar division", query: "RETURN 1s / 0", identity: vm.ErrDivisionByZero, kind: vm.DivideByZero, message: "division by zero", label: "attempt to divide by zero", hint: "Ensure the denominator is non-zero before division"},
+		{name: "Duration ratio division", query: "RETURN 1s / 0s", identity: vm.ErrDivisionByZero, kind: vm.DivideByZero, message: "division by zero", label: "attempt to divide by zero", hint: "Ensure the denominator is non-zero before division"},
+		{name: "Int modulo", query: "RETURN 1 % 0", identity: vm.ErrModuloByZero, kind: vm.ModuloByZero, message: "modulo by zero", label: "attempt to take modulo by zero", hint: "Ensure the divisor is non-zero before modulo"},
+		{name: "Float modulo", query: "RETURN 1.0 % 0.0", identity: vm.ErrModuloByZero, kind: vm.ModuloByZero, message: "modulo by zero", label: "attempt to take modulo by zero", hint: "Ensure the divisor is non-zero before modulo"},
+	}
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("%s/%s", level, test.name), func(t *testing.T) {
+				program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("zero_divisor.fql", test.query))
+				if err != nil {
+					t.Fatal(err)
+				}
+				instance, err := vm.New(program)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = instance.Close() })
+
+				result, err := instance.Run(context.Background(), vm.NewDefaultEnvironment())
+				if result != nil {
+					_ = result.Close()
+				}
+				if !errors.Is(err, test.identity) {
+					t.Fatalf("run error = %v, want %v", err, test.identity)
+				}
+				var runtimeErr *vm.RuntimeError
+				if !errors.As(err, &runtimeErr) {
+					t.Fatalf("run error type = %T, want *vm.RuntimeError", err)
+				}
+				if runtimeErr.Kind != test.kind || runtimeErr.Message != test.message {
+					t.Fatalf("diagnostic = %s: %s, want %s: %s", runtimeErr.Kind, runtimeErr.Message, test.kind, test.message)
+				}
+				formatted := runtimeErr.Format()
+				if !strings.Contains(formatted, test.label) || !strings.Contains(formatted, test.hint) {
+					t.Fatalf("diagnostic did not preserve label and hint:\n%s", formatted)
+				}
+			})
+		}
+	}
+}
+
+func TestWaitForTimeoutFailureFormatsSourceSnippet(t *testing.T) {
+	const query = `RETURN WAITFOR EXISTS []
+    TIMEOUT 1ms
+    EVERY 1ms
+    ON TIMEOUT FAIL`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("wait_timeout_fail.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			env, err := vm.NewEnvironment([]vm.EnvironmentOption{
+				vm.WithNamespace(stdlib.New()),
+			})
+			if err != nil {
+				t.Fatalf("environment init failed: %v", err)
+			}
+
+			_, err = instance.Run(context.Background(), env)
+			if err == nil {
+				t.Fatal("expected runtime error")
+			}
+
+			var runtimeErr *vm.RuntimeError
+			if !errors.As(err, &runtimeErr) {
+				t.Fatalf("expected runtime error, got %T", err)
+			}
+
+			if got, want := runtimeErr.Message, "operation timed out"; got != want {
+				t.Fatalf("unexpected runtime error message: got %q, want %q", got, want)
+			}
+
+			mainSpanFound := false
+			for _, span := range runtimeErr.Spans {
+				if !span.Main {
+					continue
+				}
+
+				mainSpanFound = true
+
+				if span.Span.Start < 0 || span.Span.End > len(query) || span.Span.End <= span.Span.Start {
+					t.Fatalf("unexpected main span bounds: %+v", span.Span)
+				}
+
+				if got, want := query[span.Span.Start:span.Span.End], "ON TIMEOUT FAIL"; got != want {
+					t.Fatalf("unexpected main span fragment: got %q, want %q", got, want)
+				}
+
+				if got, want := span.Label, "operation timed out here"; got != want {
+					t.Fatalf("unexpected main span label: got %q, want %q", got, want)
+				}
+			}
+
+			if !mainSpanFound {
+				t.Fatal("expected a main error span")
+			}
+
+			formatted := runtimeErr.Format()
+			for _, needle := range []string{
+				"UncaughtError: operation timed out",
+				" --> wait_timeout_fail.fql:4:5",
+				"3 |     EVERY 1ms",
+				"4 |     ON TIMEOUT FAIL",
+				"^^^^^^^^^^^^^^^ operation timed out here",
+				"Caused by: operation timed out",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsMissingParamWithParamSpan(t *testing.T) {
+	const query = `RETURN @foo`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("missing_param.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			_, err = instance.Run(context.Background(), vm.NewDefaultEnvironment())
+			if err == nil {
+				t.Fatal("expected runtime error")
+			}
+
+			var runtimeErr *vm.RuntimeError
+			if !errors.As(err, &runtimeErr) {
+				t.Fatalf("expected runtime error, got %T", err)
+			}
+
+			if got, want := runtimeErr.Message, "missing parameter"; got != want {
+				t.Fatalf("unexpected runtime error message: got %q, want %q", got, want)
+			}
+
+			mainSpanFound := false
+			for _, span := range runtimeErr.Spans {
+				if !span.Main {
+					continue
+				}
+
+				mainSpanFound = true
+
+				if got, want := query[span.Span.Start:span.Span.End], "@foo"; got != want {
+					t.Fatalf("unexpected main span fragment: got %q, want %q", got, want)
+				}
+
+				if got, want := span.Label, "parameter '@foo' was not provided"; got != want {
+					t.Fatalf("unexpected main span label: got %q, want %q", got, want)
+				}
+			}
+
+			if !mainSpanFound {
+				t.Fatal("expected a main error span")
+			}
+
+			formatted := runtimeErr.Format()
+			for _, needle := range []string{
+				"UnresolvedSymbol: missing parameter",
+				" --> missing_param.fql:1:8",
+				"RETURN @foo",
+				"^^^^ parameter '@foo' was not provided",
+				"Note: this query requires parameter '@foo'",
+				"Hint: Provide a value for @foo before executing this query",
+				"Caused by: missed parameter",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsNestedMissingParamAtInnerUsage(t *testing.T) {
+	const query = `FUNC inner() => @foo
+FUNC middle() {
+  LET value = inner()
+  RETURN value
+}
+FUNC outer() {
+  LET value = middle()
+  RETURN value
+}
+RETURN outer()
+`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("missing_param_udf.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			_, err = instance.Run(context.Background(), vm.NewDefaultEnvironment())
+			if err == nil {
+				t.Fatal("expected runtime error")
+			}
+
+			var runtimeErr *vm.RuntimeError
+			if !errors.As(err, &runtimeErr) {
+				t.Fatalf("expected runtime error, got %T", err)
+			}
+
+			mainSpanFound := false
+			for _, span := range runtimeErr.Spans {
+				if !span.Main {
+					continue
+				}
+
+				mainSpanFound = true
+
+				if got, want := query[span.Span.Start:span.Span.End], "@foo"; got != want {
+					t.Fatalf("unexpected main span fragment: got %q, want %q", got, want)
+				}
+			}
+
+			if !mainSpanFound {
+				t.Fatal("expected a main error span")
+			}
+
+			formatted := runtimeErr.Format()
+			for _, needle := range []string{
+				" --> missing_param_udf.fql:1:17",
+				"FUNC inner() => @foo",
+				"^^^^ parameter '@foo' was not provided",
+				"Note: this query requires parameter '@foo'",
+				"Caused by: missed parameter",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+
+			for _, needle := range []string{
+				"called from",
+				"VM stack:",
+				"RETURN outer()",
+				"RETURN value",
+			} {
+				if strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error to not contain %q, got:\n%s", needle, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsAggregatedMissingParams(t *testing.T) {
+	const query = `RETURN @foo + @bar`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("missing_params.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			_, err = instance.Run(context.Background(), vm.NewDefaultEnvironment())
+			if err == nil {
+				t.Fatal("expected aggregated runtime error")
+			}
+
+			var runtimeSet interface{ Unwrap() []error }
+			if !errors.As(err, &runtimeSet) || len(runtimeSet.Unwrap()) != 2 {
+				t.Fatalf("expected two aggregated runtime errors, got %v", err)
+			}
+
+			var runtimeErr *vm.RuntimeError
+			if !errors.As(err, &runtimeErr) || runtimeErr != runtimeSet.Unwrap()[0] {
+				t.Fatal("aggregate does not expose its first diagnostic through errors.As")
+			}
+
+			formatted := pkgdiagnostics.Format(err)
+			for _, needle := range []string{
+				" --> missing_params.fql:1:8",
+				" --> missing_params.fql:1:15",
+				"parameter '@foo' was not provided",
+				"parameter '@bar' was not provided",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error set to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+
+			if got, want := strings.Count(formatted, "UnresolvedSymbol: missing parameter"), 2; got != want {
+				t.Fatalf("unexpected missing parameter diagnostic count: got %d, want %d\n%s", got, want, formatted)
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsAggregatedRepeatedMissingParamCallsites(t *testing.T) {
+	const query = `RETURN @foo + @foo`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("missing_param_repeated.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			_, err = instance.Run(context.Background(), vm.NewDefaultEnvironment())
+			if err == nil {
+				t.Fatal("expected aggregated runtime error")
+			}
+
+			formatted := pkgdiagnostics.Format(err)
+			for _, needle := range []string{
+				" --> missing_param_repeated.fql:1:8",
+				" --> missing_param_repeated.fql:1:15",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error set to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+
+			if got, want := strings.Count(formatted, "UnresolvedSymbol: missing parameter"), 2; got != want {
+				t.Fatalf("unexpected missing parameter diagnostic count: got %d, want %d\n%s", got, want, formatted)
+			}
+
+			if got, want := strings.Count(formatted, "parameter '@foo' was not provided"), 2; got != want {
+				t.Fatalf("unexpected repeated missing parameter label count: got %d, want %d\n%s", got, want, formatted)
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsAggregatedUdfMissingParamCallsites(t *testing.T) {
+	const query = `FUNC read() => @foo
+LET left = read()
+LET right = read()
+RETURN left + right
+`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("missing_param_udf_callsites.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			_, err = instance.Run(context.Background(), vm.NewDefaultEnvironment())
+			if err == nil {
+				t.Fatal("expected aggregated runtime error")
+			}
+
+			formatted := pkgdiagnostics.Format(err)
+			for _, needle := range []string{
+				" --> missing_param_udf_callsites.fql:1:16",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error set to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+
+			if got, want := strings.Count(formatted, "UnresolvedSymbol: missing parameter"), 1; got != want {
+				t.Fatalf("unexpected missing parameter diagnostic count: got %d, want %d\n%s", got, want, formatted)
+			}
+
+			if got, want := strings.Count(formatted, "parameter '@foo' was not provided"), 1; got != want {
+				t.Fatalf("unexpected missing parameter label count: got %d, want %d\n%s", got, want, formatted)
+			}
+
+			for _, needle := range []string{
+				"called from",
+				"VM stack:",
+			} {
+				if strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error set to not contain %q, got:\n%s", needle, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsAggregatedTopLevelAndUdfMissingParams(t *testing.T) {
+	const query = `LET val = @foo
+LET val2 = @bar
+
+FUNC TEST() {
+  RETURN @baz
+}
+
+RETURN [val, val2, TEST()]
+`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("missing_param_mixed_sites.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			_, err = instance.Run(context.Background(), vm.NewDefaultEnvironment())
+			if err == nil {
+				t.Fatal("expected aggregated runtime error")
+			}
+
+			formatted := pkgdiagnostics.Format(err)
+			for _, needle := range []string{
+				"LET val = @foo",
+				"LET val2 = @bar",
+				"RETURN @baz",
+				"parameter '@foo' was not provided",
+				"parameter '@bar' was not provided",
+				"parameter '@baz' was not provided",
+			} {
+				if !strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error set to contain %q, got:\n%s", needle, formatted)
+				}
+			}
+
+			if got, want := strings.Count(formatted, "UnresolvedSymbol: missing parameter"), 3; got != want {
+				t.Fatalf("unexpected missing parameter diagnostic count: got %d, want %d\n%s", got, want, formatted)
+			}
+
+			for _, needle := range []string{
+				"called from",
+				"VM stack:",
+			} {
+				if strings.Contains(formatted, needle) {
+					t.Fatalf("expected formatted runtime error set to not contain %q, got:\n%s", needle, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeErrorFormatsArgumentTypeFailuresWithArgumentSpan(t *testing.T) {
+	const query = `RETURN BROKEN("ok", [1, 2])`
+
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		t.Run(level.String(), func(t *testing.T) {
+			program, err := mustNewCompiler(t, compiler.WithOptimizationLevel(level)).Compile(t.Context(), source.New("arg_type.fql", query))
+			if err != nil {
+				t.Fatalf("compile failed: %v", err)
+			}
+
+			instance, err := vm.New(program)
+			if err != nil {
+				t.Fatalf("vm init failed: %v", err)
+			}
+			defer func() {
+				if closeErr := instance.Close(); closeErr != nil {
+					t.Fatalf("vm close failed: %v", closeErr)
+				}
+			}()
+
+			env, err := vm.NewEnvironment([]vm.EnvironmentOption{
+				vm.WithFunction("BROKEN", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+					return runtime.None, runtime.ValidateArgTypeAt(args, 1, runtime.TypeString, runtime.TypeInt, runtime.TypeObject)
+				}),
+			})
+			if err != nil {
+				t.Fatalf("environment init failed: %v", err)
+			}
+
+			_, err = instance.Run(context.Background(), env)
+			if err == nil {
+				t.Fatal("expected runtime error")
+			}
+
+			var runtimeErr *vm.RuntimeError
+			if !errors.As(err, &runtimeErr) {
+				t.Fatalf("expected runtime error, got %T", err)
+			}
+
+			if got, want := runtimeErr.Message, "invalid argument type"; got != want {
+				t.Fatalf("unexpected runtime error message: got %q, want %q", got, want)
+			}
+
+			if got, want := runtimeErr.Kind, pkgdiagnostics.TypeError; got != want {
+				t.Fatalf("unexpected runtime error kind: got %s, want %s", got, want)
+			}
+
+			mainSpanFound := false
+			for _, span := range runtimeErr.Spans {
+				if !span.Main {
+					continue
+				}
+
+				mainSpanFound = true
+
+				if got, want := query[span.Span.Start:span.Span.End], "[1, 2]"; got != want {
+					t.Fatalf("unexpected main span fragment: got %q, want %q", got, want)
+				}
+
+				if got, want := span.Label, "argument 2 has incompatible type"; got != want {
+					t.Fatalf("unexpected main span label: got %q, want %q", got, want)
+				}
+			}
+
+			if !mainSpanFound {
+				t.Fatal("expected a main error span")
+			}
+
+			if runtimeErr.Cause == nil {
+				t.Fatal("expected nested runtime error cause")
+			}
+
+			if got, want := runtimeErr.Note, "argument 2 expects String or Int or Object, but got Array"; got != want {
+				t.Fatalf("unexpected runtime error note: got %q, want %q", got, want)
+			}
+
+			if got, want := runtimeErr.Hint, "Convert argument 2 to String or Int or Object before this call"; got != want {
+				t.Fatalf("unexpected runtime error hint: got %q, want %q", got, want)
+			}
+
+			if !strings.Contains(runtimeErr.Format(), "Hint: Convert argument 2 to String or Int or Object before this call") {
+				t.Fatalf("expected formatted runtime error to include synthesized hint, got:\n%s", runtimeErr.Format())
+			}
+
+			if got, want := runtimeErr.Cause.Error(), "invalid type"; got != want {
+				t.Fatalf("unexpected runtime error cause: got %q, want %q", got, want)
+			}
+		})
+	}
+}

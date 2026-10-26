@@ -1,0 +1,31 @@
+package runtime_test
+
+import (
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+
+	. "github.com/smartystreets/goconvey/convey"
+)
+
+func TestInt(t *testing.T) {
+	Convey(".Hash", t, func() {
+		Convey("It should calculate hash", func() {
+			v := runtime.NewInt(1)
+
+			h := v.Hash()
+
+			So(h, ShouldBeGreaterThan, 0)
+
+			v2 := runtime.NewInt(2)
+
+			So(h, ShouldNotEqual, v2.Hash())
+		})
+
+		Convey("Hash sum should be consistent", func() {
+			v := runtime.NewInt(1)
+
+			So(v.Hash(), ShouldEqual, v.Hash())
+		})
+	})
+}

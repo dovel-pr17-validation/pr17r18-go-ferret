@@ -1,0 +1,104 @@
+package core
+
+import (
+	"fmt"
+
+	"github.com/MontFerret/ferret/v2/pkg/bytecode"
+)
+
+type LoopTable struct {
+	registers *RegisterAllocator
+	ordinals  map[int]int
+	stack     []*Loop
+}
+
+func NewLoopTable(registers *RegisterAllocator) *LoopTable {
+	return &LoopTable{
+		stack:     make([]*Loop, 0),
+		registers: registers,
+		ordinals:  make(map[int]int),
+	}
+}
+
+func (lt *LoopTable) NewForInLoop(loopType LoopType, distinct bool) *Loop {
+	return lt.NewLoop(ForInLoop, loopType, distinct, true)
+}
+
+func (lt *LoopTable) NewForWhileLoop(loopType LoopType, distinct bool) *Loop {
+	return lt.NewLoop(WhileLoop, loopType, distinct, true)
+}
+
+func (lt *LoopTable) NewLoop(kind LoopKind, loopType LoopType, distinct, collectResult bool) *Loop {
+	parent := lt.Current()
+	allocate := collectResult && (parent == nil || parent.Type != PassThroughLoop)
+	result := bytecode.NoopOperand
+
+	if collectResult && loopType != TemporalLoop {
+		if allocate {
+			result = lt.registers.Allocate()
+		} else {
+			result = parent.Dst
+		}
+	}
+
+	return &Loop{
+		Type:          loopType,
+		Kind:          kind,
+		Distinct:      distinct,
+		Dst:           result,
+		Allocate:      allocate,
+		CollectResult: collectResult,
+	}
+}
+
+func (lt *LoopTable) Push(loop *Loop) {
+	lt.stack = append(lt.stack, loop)
+	loop.LabelBase = lt.NextBase()
+}
+
+func (lt *LoopTable) Pop() *Loop {
+	if len(lt.stack) == 0 {
+		return nil
+	}
+	top := lt.stack[len(lt.stack)-1]
+	lt.stack = lt.stack[:len(lt.stack)-1]
+	return top
+}
+
+func (lt *LoopTable) FindParent(pos int) *Loop {
+	for i := pos - 1; i >= 0; i-- {
+		loop := lt.stack[i]
+
+		if loop.Allocate {
+			return loop
+		}
+	}
+
+	return nil
+}
+
+func (lt *LoopTable) RequiredParent(pos int) *Loop {
+	parent := lt.FindParent(pos)
+	if parent == nil {
+		PanicInvariantf("parent loop not found in loop table at depth %d", pos)
+	}
+
+	return parent
+}
+
+func (lt *LoopTable) Current() *Loop {
+	if len(lt.stack) == 0 {
+		return nil
+	}
+	return lt.stack[len(lt.stack)-1]
+}
+
+func (lt *LoopTable) Depth() int {
+	return len(lt.stack)
+}
+
+func (lt *LoopTable) NextBase() string {
+	depth := lt.Depth()
+	lt.ordinals[depth]++
+	return fmt.Sprintf("%d.%d", depth, lt.ordinals[depth])
+}

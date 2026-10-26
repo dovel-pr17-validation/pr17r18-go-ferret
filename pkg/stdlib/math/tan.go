@@ -1,0 +1,19 @@
+package math
+
+import (
+	"context"
+	"math"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// tan returns the tangent of a given number.
+// @param number {Int | Float} A number.
+// @return {Float} The tangent.
+func Tan(_ context.Context, arg runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgValue(arg, 0, runtime.AssertNumber); err != nil {
+		return runtime.None, err
+	}
+
+	return runtime.NewFloat(math.Tan(toFloat(arg))), nil
+}

@@ -1,0 +1,14 @@
+package math
+
+import (
+	"context"
+	"math"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// pi returns Pi value.
+// @return {Float} Pi value.
+func Pi(_ context.Context) (runtime.Value, error) {
+	return runtime.NewFloat(math.Pi), nil
+}

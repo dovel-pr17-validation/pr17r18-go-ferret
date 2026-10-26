@@ -1,0 +1,374 @@
+package vm_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/compiler"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/vm"
+	"github.com/MontFerret/ferret/v2/test/spec"
+	. "github.com/MontFerret/ferret/v2/test/spec/exec"
+)
+
+func TestWaitforPredicate(t *testing.T) {
+	RunSpecs(t, []spec.Spec{
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR (DATE_DIFF(start, NOW(), "f") >= 30) TIMEOUT 0.5s EVERY 0.01s BACKOFF LINEAR
+			RETURN ok
+		`, true, "Should wait until predicate becomes true"),
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR (DATE_DIFF(start, NOW(), "f") >= 30) TIMEOUT 0.5s EVERY 10ms, 30ms BACKOFF LINEAR JITTER 0.2
+			RETURN ok
+		`, true, "Should support EVERY cap with JITTER"),
+		S(`
+			LET ok = WAITFOR FALSE TIMEOUT 50ms EVERY 10ms
+			RETURN ok
+		`, false, "Should return false on timeout"),
+		S(`
+			LET ok = WAITFOR FALSE TIMEOUT 80ms EVERY 10ms, 10ms BACKOFF EXPONENTIAL JITTER 0.5
+			RETURN ok
+		`, false, "Should honor timeout with cap and jitter"),
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR EXISTS (DATE_DIFF(start, NOW(), "f") > 20 ? [1] : []) TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for non-empty value with EXISTS"),
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR NOT EXISTS (DATE_DIFF(start, NOW(), "f") > 20 ? "" : "x") TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for empty value with NOT EXISTS"),
+		S(`
+			LET start = NOW()
+			LET token = WAITFOR VALUE (DATE_DIFF(start, NOW(), "f") > 20 ? "ok" : NONE) TIMEOUT 0.5s EVERY 10ms
+			RETURN token
+		`, "ok", "Should return value once it exists"),
+		S(`
+			RETURN WAITFOR VALUE "" TIMEOUT 20ms
+		`, "", "Should return an empty string value immediately"),
+		Object(`
+			RETURN WAITFOR VALUE {} TIMEOUT 20ms
+		`, map[string]any{}, "Should return an empty object value immediately"),
+		Array(`
+			RETURN WAITFOR VALUE [] TIMEOUT 20ms
+		`, []any{}, "Should return an empty array value immediately"),
+		Array(`
+			RETURN WAITFOR VALUE [] WHEN LENGTH(.) == 0 TIMEOUT 20ms
+		`, []any{}, "Should evaluate WHEN for an empty non-NONE value"),
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR EXISTS (DATE_DIFF(start, NOW(), "f") > 20 ? { foo: 1 } : {}) TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for non-empty object with EXISTS"),
+		Object(`
+			LET start = NOW()
+			LET obj = WAITFOR VALUE (DATE_DIFF(start, NOW(), "f") > 20 ? { foo: 1 } : {}) WHEN LENGTH(.) > 0 TIMEOUT 0.5s EVERY 10ms
+			RETURN obj
+		`, map[string]any{"foo": 1}, "Should return object once WHEN accepts the candidate"),
+		Array(`
+			LET start = NOW()
+			LET arr = WAITFOR VALUE (DATE_DIFF(start, NOW(), "f") > 20 ? [1, 2] : []) WHEN LENGTH(.) > 0 TIMEOUT 0.5s EVERY 10ms
+			RETURN arr
+		`, []any{1, 2}, "Should return array once WHEN accepts the candidate"),
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR EXISTS (DATE_DIFF(start, NOW(), "f") > 20 ? "ok" : "") TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for non-empty string with EXISTS"),
+		S(`
+			LET start = NOW()
+			LET ok = WAITFOR NOT EXISTS (DATE_DIFF(start, NOW(), "f") > 20 ? {} : { foo: 1 }) TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for empty object with NOT EXISTS"),
+		S(`
+			LET obj = {
+				list: ["bar", "baz"],
+			}
+			LET ok = WAITFOR EXISTS obj.list TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for non empty-array with EXISTS"),
+		S(`
+			LET obj = {
+				list: [],
+			}
+			LET ok = WAITFOR NOT EXISTS obj.list TIMEOUT 0.5s EVERY 10ms
+			RETURN ok
+		`, true, "Should wait for non empty-array with EXISTS"),
+		Nil(`
+			LET token = WAITFOR VALUE NONE TIMEOUT 20ms EVERY 5ms
+			RETURN token
+		`, "Should return NONE on timeout for VALUE"),
+		Nil(`
+			LET token = WAITFOR VALUE NONE TIMEOUT 20ms EVERY 5ms ON ERROR FAIL
+			RETURN token
+		`, "Explicit FAIL should preserve timeout result semantics"),
+		Object(`
+			LET value = WAITFOR VALUE { ok: true, kind: "candidate" } WHEN .ok
+			RETURN value
+		`, map[string]any{"ok": true, "kind": "candidate"}, "WAITFOR VALUE WHEN should return the candidate value"),
+		Object(`
+			LET value = WAITFOR VALUE { ok: true, kind: "candidate" } WHEN .ok WHEN .kind == "candidate"
+			RETURN value
+		`, map[string]any{"ok": true, "kind": "candidate"}, "WAITFOR VALUE repeated WHEN clauses should return the candidate value"),
+		S(`
+			LET ok = WAITFOR EXISTS [1, 2, 3] WHEN LENGTH(.) >= 3
+			RETURN ok
+		`, true, "WAITFOR EXISTS WHEN should bind the full candidate array"),
+		S(`
+			LET ok = WAITFOR EXISTS [1, 2, 3] WHEN LENGTH(.) >= 3 WHEN LENGTH(.) > 0
+			RETURN ok
+		`, true, "WAITFOR EXISTS repeated WHEN clauses should bind the full candidate array"),
+		S(`
+			LET ok = WAITFOR NOT EXISTS [] WHEN LENGTH(.) == 0
+			RETURN ok
+		`, true, "WAITFOR NOT EXISTS WHEN should bind the not-existing candidate value"),
+		S(`
+			LET ok = WAITFOR NOT EXISTS [] WHEN LENGTH(.) == 0 WHEN . != NONE
+			RETURN ok
+		`, true, "WAITFOR NOT EXISTS repeated WHEN clauses should bind the not-existing candidate value"),
+		Nil(`
+			LET token = WAITFOR VALUE "ok" WHEN false TIMEOUT 20ms EVERY 5ms ON TIMEOUT RETURN NONE
+			RETURN token
+		`, "WAITFOR VALUE WHEN should honor ON TIMEOUT when the predicate never passes"),
+		Nil(`
+			LET token = WAITFOR VALUE "ok" WHEN true WHEN false TIMEOUT 20ms EVERY 5ms ON TIMEOUT RETURN NONE
+			RETURN token
+		`, "WAITFOR VALUE repeated WHEN clauses should honor ON TIMEOUT when any predicate never passes"),
+		S(`
+			LET ok = WAITFOR EXISTS [1] WHEN false TIMEOUT 20ms EVERY 5ms ON TIMEOUT RETURN false
+			RETURN ok
+		`, false, "WAITFOR EXISTS WHEN should honor ON TIMEOUT when the predicate never passes"),
+	})
+}
+
+func TestWaitforPredicateSynchronizationGroups(t *testing.T) {
+	RunSpecs(t, []spec.Spec{
+		S(`RETURN WAITFOR ANY { false true }`, true, "WAITFOR ANY should accept the first qualifying arm"),
+		S(`RETURN WAITFOR ALL { true true }`, true, "WAITFOR ALL should require every arm"),
+		S(`LET first = [] LET second = [1] RETURN WAITFOR EXISTS ANY { first second }`, true, "WAITFOR EXISTS ANY should share existence semantics"),
+		S(`LET first = [1] LET second = { ready: true } RETURN WAITFOR EXISTS ALL { first second }`, true, "WAITFOR EXISTS ALL should require every arm to exist"),
+		S(`LET first = [1] LET second = [] RETURN WAITFOR NOT EXISTS ANY { first second }`, true, "WAITFOR NOT EXISTS ANY should share non-existence semantics"),
+		S(`LET first = [] LET second = {} RETURN WAITFOR NOT EXISTS ALL { first second }`, true, "WAITFOR NOT EXISTS ALL should require every arm to be empty"),
+		S(`LET first = NONE LET second = "second" RETURN WAITFOR VALUE ANY { first second }`, "second", "WAITFOR VALUE ANY should return the winning value"),
+		S(`LET first = "first" LET second = "second" RETURN WAITFOR VALUE ANY { first second }`, "first", "WAITFOR VALUE ANY should use declaration order"),
+		Array(`LET first = "first" LET second = "second" RETURN WAITFOR VALUE ALL { first second }`, []any{"first", "second"}, "WAITFOR VALUE ALL should return declaration order"),
+		Array(`RETURN WAITFOR VALUE ALL { { ready: true, value: 1 } WHEN .ready { ready: true, value: 2 } WHEN .value == 2 }`, []any{
+			map[string]any{"ready": true, "value": 1},
+			map[string]any{"ready": true, "value": 2},
+		}, "WAITFOR VALUE ALL should apply filters per arm"),
+		S(`RETURN WAITFOR ANY { true }`, true, "one-arm WAITFOR ANY should remain grouped and behave consistently"),
+		S(`RETURN WAITFOR ALL { true false } TIMEOUT 2ms EVERY 0ms ON TIMEOUT RETURN false`, false, "WAITFOR ALL should use one shared timeout"),
+	})
+}
+
+func TestWaitforPredicateSynchronizationShortCircuit(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		anySecondCalls := 0
+		allSecondCalls := 0
+
+		RunSpecsWith(
+			t,
+			fmt.Sprintf("VM/%s", level),
+			mustNewCompiler(t, compiler.WithOptimizationLevel(level)),
+			[]spec.Spec{
+				S(`RETURN WAITFOR ANY { true ANY_SECOND() }`, true, "WAITFOR ANY should short-circuit in declaration order"),
+				S(`RETURN WAITFOR ALL { false ALL_SECOND() } TIMEOUT 2ms EVERY 0ms ON TIMEOUT RETURN false`, false, "WAITFOR ALL should short-circuit in declaration order"),
+			},
+			vm.WithFunction("ANY_SECOND", func(context.Context, ...runtime.Value) (runtime.Value, error) {
+				anySecondCalls++
+				return runtime.True, nil
+			}),
+			vm.WithFunction("ALL_SECOND", func(context.Context, ...runtime.Value) (runtime.Value, error) {
+				allSecondCalls++
+				return runtime.True, nil
+			}),
+		)
+
+		if anySecondCalls != 0 {
+			t.Fatalf("WAITFOR ANY evaluated a later arm for %s: got %d calls", level, anySecondCalls)
+		}
+		if allSecondCalls != 0 {
+			t.Fatalf("WAITFOR ALL evaluated a later arm after failure for %s: got %d calls", level, allSecondCalls)
+		}
+	}
+}
+
+func TestWaitforPredicateSynchronizationDoesNotAccumulateAcrossCycles(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		leftCalls := 0
+		rightCalls := 0
+
+		RunSpecsWith(
+			t,
+			fmt.Sprintf("VM/%s", level),
+			mustNewCompiler(t, compiler.WithOptimizationLevel(level)),
+			[]spec.Spec{
+				S(`RETURN WAITFOR ALL { LEFT() RIGHT() } TIMEOUT 5ms EVERY 0ms ON TIMEOUT RETURN false`, false, "WAITFOR ALL should require every arm to pass in the same polling cycle"),
+			},
+			vm.WithFunction("LEFT", func(context.Context, ...runtime.Value) (runtime.Value, error) {
+				leftCalls++
+				return runtime.NewBoolean(leftCalls == 1), nil
+			}),
+			vm.WithFunction("RIGHT", func(context.Context, ...runtime.Value) (runtime.Value, error) {
+				rightCalls++
+				return runtime.NewBoolean(rightCalls > 1), nil
+			}),
+		)
+
+		if leftCalls < 2 {
+			t.Fatalf("WAITFOR ALL did not begin another full cycle for %s: got %d left-arm calls", level, leftCalls)
+		}
+		if rightCalls != 1 {
+			t.Fatalf("WAITFOR ALL retained arm state across cycles for %s: got %d right-arm calls", level, rightCalls)
+		}
+	}
+}
+
+func TestWaitforPredicateWhenRetriesUntilTrue(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		callCount := 0
+
+		RunSpecsWith(
+			t,
+			fmt.Sprintf("VM/%s", level),
+			mustNewCompiler(t, compiler.WithOptimizationLevel(level)),
+			[]spec.Spec{
+				S(`
+					LET token = WAITFOR VALUE CANDIDATE() WHEN .state == "ready" TIMEOUT 100ms EVERY 0ms
+					RETURN token.value
+				`, "ok", "WAITFOR VALUE WHEN should retry until the predicate passes"),
+			},
+			vm.WithFunction("CANDIDATE", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+				callCount++
+
+				state := "pending"
+				if callCount >= 3 {
+					state = "ready"
+				}
+
+				return runtime.NewObjectWith(map[string]runtime.Value{
+					"state": runtime.NewString(state),
+					"value": runtime.NewString("ok"),
+				}), nil
+			}),
+		)
+
+		if got, want := callCount, 3; got != want {
+			t.Fatalf("unexpected WAITFOR VALUE WHEN candidate call count for %s: got %d, want %d", level, got, want)
+		}
+	}
+}
+
+func TestWaitforValueExpressionReevaluatesUntilPresent(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		callCount := 0
+
+		RunSpecsWith(
+			t,
+			fmt.Sprintf("VM/%s", level),
+			mustNewCompiler(t, compiler.WithOptimizationLevel(level)),
+			[]spec.Spec{
+				S(`RETURN WAITFOR VALUE CANDIDATE() TIMEOUT 100ms EVERY 0ms`, "ready", "WAITFOR VALUE should reevaluate its expression on every polling cycle"),
+			},
+			vm.WithFunction("CANDIDATE", func(context.Context, ...runtime.Value) (runtime.Value, error) {
+				callCount++
+				if callCount < 3 {
+					return runtime.None, nil
+				}
+
+				return runtime.NewString("ready"), nil
+			}),
+		)
+
+		if got, want := callCount, 3; got != want {
+			t.Fatalf("WAITFOR VALUE candidate calls for %s = %d, want %d", level, got, want)
+		}
+	}
+}
+
+func TestWaitforPredicateWhenSkipsPredicateUntilBasePasses(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		predicateCalls := 0
+
+		RunSpecsWith(
+			t,
+			fmt.Sprintf("VM/%s", level),
+			mustNewCompiler(t, compiler.WithOptimizationLevel(level)),
+			[]spec.Spec{
+				S(`
+					LET ok = WAITFOR EXISTS NONE WHEN PREDICATE(.) TIMEOUT 20ms EVERY 1ms ON TIMEOUT RETURN false
+					RETURN ok
+				`, false, "WAITFOR EXISTS WHEN should not evaluate the predicate before existence passes"),
+				Nil(`
+					LET value = WAITFOR VALUE NONE WHEN PREDICATE(.) TIMEOUT 20ms EVERY 1ms ON TIMEOUT RETURN NONE
+					RETURN value
+				`, "WAITFOR VALUE WHEN should not evaluate the predicate before presence passes"),
+			},
+			vm.WithFunction("PREDICATE", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+				predicateCalls++
+
+				return runtime.True, nil
+			}),
+		)
+
+		if got := predicateCalls; got != 0 {
+			t.Fatalf("WAITFOR EXISTS WHEN evaluated predicate before existence passed for %s: got %d calls", level, got)
+		}
+	}
+}
+
+func TestWaitforPredicateMultipleWhenShortCircuits(t *testing.T) {
+	for _, level := range []compiler.OptimizationLevel{compiler.None, compiler.Full} {
+		firstCalls := 0
+		secondCalls := 0
+
+		RunSpecsWith(
+			t,
+			fmt.Sprintf("VM/%s", level),
+			mustNewCompiler(t, compiler.WithOptimizationLevel(level)),
+			[]spec.Spec{
+				Nil(`
+					LET token = WAITFOR VALUE "ok" WHEN REPEATED_WHEN_FIRST(.) WHEN REPEATED_WHEN_SECOND(.) TIMEOUT 20ms EVERY 1ms ON TIMEOUT RETURN NONE
+					RETURN token
+				`, "WAITFOR VALUE repeated WHEN clauses should short-circuit after the first false predicate"),
+			},
+			vm.WithFunction("REPEATED_WHEN_FIRST", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+				firstCalls++
+
+				return runtime.False, nil
+			}),
+			vm.WithFunction("REPEATED_WHEN_SECOND", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+				secondCalls++
+
+				return runtime.True, nil
+			}),
+		)
+
+		if firstCalls == 0 {
+			t.Fatalf("WAITFOR VALUE repeated WHEN did not evaluate the first predicate for %s", level)
+		}
+		if secondCalls != 0 {
+			t.Fatalf("WAITFOR VALUE repeated WHEN evaluated a later predicate after false for %s: got %d calls", level, secondCalls)
+		}
+	}
+}
+
+func TestWaitforPredicateWhenUsesOperationErrorPolicy(t *testing.T) {
+	RunSpecs(t, []spec.Spec{
+		S(`
+			RETURN WAITFOR VALUE "ok" WHEN FAIL_PREDICATE(.) TIMEOUT 20ms EVERY 0ms ON ERROR RETURN "error"
+		`, "error", "WAITFOR VALUE WHEN predicate errors should use the wait error policy"),
+		S(`
+			RETURN WAITFOR VALUE "ok" WHEN true WHEN FAIL_PREDICATE(.) TIMEOUT 20ms EVERY 0ms ON ERROR RETURN "error"
+		`, "error", "WAITFOR VALUE repeated WHEN predicate errors should use the wait error policy"),
+		S(`
+			RETURN WAITFOR ANY { FAIL_PREDICATE(NONE) true } TIMEOUT 20ms EVERY 0ms ON ERROR RETURN "error"
+		`, "error", "WAITFOR predicate group arm errors should use the shared wait error policy"),
+	}, vm.WithFunction("FAIL_PREDICATE", func(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+		return runtime.None, fmt.Errorf("predicate failed")
+	}))
+}

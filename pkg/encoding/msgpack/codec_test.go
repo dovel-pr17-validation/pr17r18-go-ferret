@@ -1,0 +1,1232 @@
+package msgpack_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"math"
+	"reflect"
+	"strconv"
+	"testing"
+	"time"
+
+	ferretencoding "github.com/MontFerret/ferret/v2/pkg/encoding"
+
+	vmmsgpack "github.com/vmihailenco/msgpack/v5"
+
+	ferretmsgpack "github.com/MontFerret/ferret/v2/pkg/encoding/msgpack"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+type iterOnly struct {
+	items []runtime.Value
+}
+
+type iterOnlyIter struct {
+	items []runtime.Value
+	idx   int
+}
+
+func (i *iterOnly) String() string {
+	return "iterable"
+}
+
+func (i *iterOnly) Hash() uint64 {
+	return 0
+}
+
+func (i *iterOnly) Copy() runtime.Value {
+	return i
+}
+
+func (i *iterOnly) Iterate(_ context.Context) (runtime.Iterator, error) {
+	return &iterOnlyIter{items: i.items}, nil
+}
+
+func (it *iterOnlyIter) Next(_ context.Context) (runtime.Value, runtime.Value, error) {
+	if it.idx >= len(it.items) {
+		return runtime.None, runtime.None, io.EOF
+	}
+
+	value := it.items[it.idx]
+	key := runtime.NewInt(it.idx)
+	it.idx++
+
+	return value, key, nil
+}
+
+type unwrapValue struct {
+	value any
+}
+
+func (u *unwrapValue) String() string {
+	return "unwrap"
+}
+
+func (u *unwrapValue) Hash() uint64 {
+	return 0
+}
+
+func (u *unwrapValue) Copy() runtime.Value {
+	return u
+}
+
+func (u *unwrapValue) Unwrap() any {
+	return u.value
+}
+
+type marshalerValue struct{}
+
+func (m *marshalerValue) String() string {
+	return "marshal"
+}
+
+func (m *marshalerValue) Hash() uint64 {
+	return 0
+}
+
+func (m *marshalerValue) Copy() runtime.Value {
+	return m
+}
+
+func (m *marshalerValue) MarshalMsgpack() ([]byte, error) {
+	return vmmsgpack.Marshal(map[string]any{"custom": true})
+}
+
+type badValue struct {
+	Fn func()
+}
+
+func (b *badValue) String() string {
+	return "bad"
+}
+
+func (b *badValue) Hash() uint64 {
+	return 0
+}
+
+func (b *badValue) Copy() runtime.Value {
+	return b
+}
+
+func nestedArrayWithLeaf(depth int, leaf runtime.Value) runtime.Value {
+	value := leaf
+
+	for i := 0; i < depth; i++ {
+		value = runtime.NewArrayWith(value)
+	}
+
+	return value
+}
+
+func nestedArray(depth int) runtime.Value {
+	return nestedArrayWithLeaf(depth, runtime.NewInt(1))
+}
+
+func nestedObject(depth int) runtime.Value {
+	value := runtime.Value(runtime.NewInt(1))
+
+	for i := 0; i < depth; i++ {
+		value = runtime.NewObjectWith(map[string]runtime.Value{"x": value})
+	}
+
+	return value
+}
+
+func hookValueLabel(value runtime.Value) string {
+	switch v := value.(type) {
+	case nil:
+		return "<nil>"
+	case *badValue:
+		return "bad"
+	case runtime.Map:
+		return "map"
+	case runtime.List:
+		return "list"
+	case runtime.String:
+		return "string:" + string(v)
+	default:
+		return value.String()
+	}
+}
+
+func mustMarshalNative(t *testing.T, value any) []byte {
+	t.Helper()
+
+	out, err := vmmsgpack.Marshal(value)
+	if err != nil {
+		t.Fatalf("msgpack marshal failed: %v", err)
+	}
+
+	return out
+}
+
+func mustEncodeRaw(t *testing.T, encode func(*vmmsgpack.Encoder) error) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	enc := vmmsgpack.NewEncoder(&buf)
+
+	if err := encode(enc); err != nil {
+		t.Fatalf("raw encode failed: %v", err)
+	}
+
+	return buf.Bytes()
+}
+
+func assertValueEqual(t *testing.T, got, expected runtime.Value) {
+	t.Helper()
+
+	equal, err := runtime.EqualValues(t.Context(), got, expected)
+	if err != nil || !equal {
+		t.Fatalf("expected %s, got %s", expected, got)
+	}
+}
+
+func TestMsgpackCodecEncode(t *testing.T) {
+	codec := ferretmsgpack.Default
+	ctx := context.Background()
+
+	assertBytes := func(t *testing.T, value runtime.Value, expected []byte) {
+		t.Helper()
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if !bytes.Equal(out, expected) {
+			t.Fatalf("expected %x, got %x", expected, out)
+		}
+	}
+
+	t.Run("none", func(t *testing.T) {
+		assertBytes(t, runtime.None, mustMarshalNative(t, nil))
+	})
+
+	t.Run("boolean", func(t *testing.T) {
+		assertBytes(t, runtime.True, mustMarshalNative(t, true))
+		assertBytes(t, runtime.False, mustMarshalNative(t, false))
+	})
+
+	t.Run("string", func(t *testing.T) {
+		assertBytes(t, runtime.NewString("hello"), mustMarshalNative(t, "hello"))
+	})
+
+	t.Run("int_matches_native", func(t *testing.T) {
+		assertBytes(t, runtime.NewInt(42), mustMarshalNative(t, 42))
+	})
+
+	t.Run("float", func(t *testing.T) {
+		assertBytes(t, runtime.NewFloat(42.5), mustMarshalNative(t, 42.5))
+	})
+
+	t.Run("duration", func(t *testing.T) {
+		encoded := mustMarshalNative(t, "1.5s")
+		assertBytes(t, runtime.NewDuration(1500*time.Millisecond), encoded)
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded != runtime.NewString("1.5s") {
+			t.Fatalf("decoded duration string = %v (%T)", decoded, decoded)
+		}
+	})
+
+	t.Run("regexp", func(t *testing.T) {
+		value, err := runtime.NewRegexp(`^<item>&[a-z]+>$`)
+		if err != nil {
+			t.Fatalf("compile regexp: %v", err)
+		}
+
+		encoded := mustMarshalNative(t, `^<item>&[a-z]+>$`)
+		assertBytes(t, value, encoded)
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if decoded != runtime.NewString(`^<item>&[a-z]+>$`) {
+			t.Fatalf("decoded regexp string = %v (%T)", decoded, decoded)
+		}
+	})
+
+	t.Run("range", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			want  []int64
+			start runtime.Int
+			end   runtime.Int
+		}{
+			{name: "ascending", start: 1, end: 3, want: []int64{1, 2, 3}},
+			{name: "descending", start: 3, end: 1, want: []int64{3, 2, 1}},
+			{name: "negative ascending", start: -3, end: -1, want: []int64{-3, -2, -1}},
+			{name: "negative descending", start: -1, end: -3, want: []int64{-1, -2, -3}},
+			{name: "cross zero", start: -1, end: 1, want: []int64{-1, 0, 1}},
+			{name: "minimum singleton", start: math.MinInt64, end: math.MinInt64, want: []int64{math.MinInt64}},
+			{name: "maximum singleton", start: math.MaxInt64, end: math.MaxInt64, want: []int64{math.MaxInt64}},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				encoded := mustEncodeRaw(t, func(enc *vmmsgpack.Encoder) error {
+					if err := enc.EncodeArrayLen(len(test.want)); err != nil {
+						return err
+					}
+
+					for _, value := range test.want {
+						if err := enc.EncodeInt(value); err != nil {
+							return err
+						}
+					}
+
+					return nil
+				})
+				assertBytes(t, runtime.NewRange(test.start, test.end), encoded)
+
+				decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, encoded)
+				if err != nil {
+					t.Fatalf("decode failed: %v", err)
+				}
+
+				arr, ok := decoded.(*runtime.Array)
+				if !ok {
+					t.Fatalf("decoded range = %T, want *runtime.Array", decoded)
+				}
+
+				values := make([]runtime.Value, len(test.want))
+				for idx, value := range test.want {
+					values[idx] = runtime.NewInt64(value)
+
+					item, err := arr.At(ctx, runtime.NewInt(idx))
+					if err != nil {
+						t.Fatalf("array at %d failed: %v", idx, err)
+					}
+
+					if item != values[idx] {
+						t.Fatalf("item %d = %v (%T), want Int(%d)", idx, item, item, value)
+					}
+				}
+
+				assertValueEqual(t, decoded, runtime.NewArrayOf(values))
+			})
+		}
+	})
+
+	t.Run("range rejects unrepresentable lengths", func(t *testing.T) {
+		maxArrayLength := uint64(math.MaxUint32)
+		if strconv.IntSize == 32 {
+			maxArrayLength = math.MaxInt32
+		}
+
+		tests := []struct {
+			value *runtime.Range
+			name  string
+		}{
+			{name: "runtime capacity", value: runtime.NewRange(math.MinInt64, -1)},
+			{name: "MessagePack capacity", value: runtime.NewRange(0, runtime.Int(maxArrayLength))},
+		}
+
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				out, err := ferretencoding.EncodeBytes(t.Context(), codec, test.value)
+				if !errors.Is(err, runtime.ErrRange) {
+					t.Fatalf("encode error = %v, want ErrRange", err)
+				}
+
+				if out != nil {
+					t.Fatalf("encode output = %x, want nil", out)
+				}
+			})
+		}
+	})
+
+	t.Run("binary", func(t *testing.T) {
+		data := []byte("hi")
+		assertBytes(t, runtime.NewBinary(data), mustMarshalNative(t, data))
+	})
+
+	t.Run("datetime", func(t *testing.T) {
+		ts := time.Date(2024, time.January, 2, 3, 4, 5, 6, time.UTC)
+		assertBytes(t, runtime.NewDateTime(ts), mustMarshalNative(t, ts))
+	})
+
+	t.Run("array", func(t *testing.T) {
+		value := runtime.NewArrayWith(runtime.NewInt(1), runtime.NewDuration(1500*time.Millisecond), runtime.True)
+		expected := mustMarshalNative(t, []any{1, "1.5s", true})
+		assertBytes(t, value, expected)
+	})
+
+	t.Run("deeply_nested_array", func(t *testing.T) {
+		depth := 100_000
+		value := nestedArray(depth)
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		current := decoded
+		for i := 0; i < depth; i++ {
+			arr, ok := current.(*runtime.Array)
+			if !ok {
+				t.Fatalf("expected Array at depth %d, got %T", i, current)
+			}
+
+			current, err = arr.At(ctx, 0)
+			if err != nil {
+				t.Fatalf("array at depth %d failed: %v", i, err)
+			}
+		}
+
+		assertValueEqual(t, current, runtime.NewInt(1))
+	})
+
+	t.Run("object_round_trip", func(t *testing.T) {
+		obj := runtime.NewObject()
+		if err := obj.Set(ctx, runtime.NewString("b"), runtime.NewInt(2)); err != nil {
+			t.Fatalf("set b failed: %v", err)
+		}
+		if err := obj.Set(ctx, runtime.NewString("a"), runtime.NewInt(1)); err != nil {
+			t.Fatalf("set a failed: %v", err)
+		}
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, obj)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		assertValueEqual(t, decoded, obj)
+	})
+
+	t.Run("deeply_nested_object", func(t *testing.T) {
+		depth := 40_000
+		value := nestedObject(depth)
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		current := decoded
+		for i := 0; i < depth; i++ {
+			obj, ok := current.(*runtime.Object)
+			if !ok {
+				t.Fatalf("expected Object at depth %d, got %T", i, current)
+			}
+
+			current, err = obj.Get(ctx, runtime.NewString("x"))
+			if err != nil {
+				t.Fatalf("object get at depth %d failed: %v", i, err)
+			}
+		}
+
+		assertValueEqual(t, current, runtime.NewInt(1))
+	})
+
+	t.Run("box", func(t *testing.T) {
+		value := runtime.NewBox(7)
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		assertValueEqual(t, decoded, runtime.NewInt(7))
+	})
+
+	t.Run("iterable_branch", func(t *testing.T) {
+		iter := &iterOnly{items: []runtime.Value{runtime.NewInt(1), runtime.NewString("x")}}
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, iter)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		assertValueEqual(t, decoded, runtime.NewArrayWith(runtime.NewInt(1), runtime.NewString("x")))
+	})
+
+	t.Run("unwrappable_branch", func(t *testing.T) {
+		value := &unwrapValue{value: map[string]any{"a": 1}}
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		expected := runtime.NewObjectWith(map[string]runtime.Value{
+			"a": runtime.NewInt(1),
+		})
+
+		assertValueEqual(t, decoded, expected)
+	})
+
+	t.Run("msgpack_marshaler_branch", func(t *testing.T) {
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, &marshalerValue{})
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), codec, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		expected := runtime.NewObjectWith(map[string]runtime.Value{
+			"custom": runtime.True,
+		})
+
+		assertValueEqual(t, decoded, expected)
+	})
+
+	t.Run("object_msgpack_equivalence", func(t *testing.T) {
+		obj := runtime.NewObjectWith(map[string]runtime.Value{
+			"a": runtime.NewInt(1),
+			"b": runtime.NewString("x"),
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), codec, obj)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		var got map[string]any
+		if err := vmmsgpack.Unmarshal(out, &got); err != nil {
+			t.Fatalf("msgpack unmarshal failed: %v", err)
+		}
+
+		if got["b"] != "x" {
+			t.Fatalf("expected string value x, got %#v", got["b"])
+		}
+
+		if got["a"] == nil || reflect.ValueOf(got["a"]).Kind() == reflect.Invalid ||
+			got["a"] != int8(1) && got["a"] != int16(1) && got["a"] != int32(1) && got["a"] != int64(1) && got["a"] != int(1) &&
+				got["a"] != uint8(1) && got["a"] != uint16(1) && got["a"] != uint32(1) && got["a"] != uint64(1) && got["a"] != uint(1) {
+			t.Fatalf("expected integer value 1, got %#v", got["a"])
+		}
+	})
+}
+
+func TestMsgpackCodecEncodeHooks(t *testing.T) {
+	t.Run("hooks_run_in_order", func(t *testing.T) {
+		var order []string
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			if value != runtime.NewInt(7) {
+				t.Fatalf("expected hook value 7, got %v", value)
+			}
+
+			order = append(order, "pre1")
+
+			return nil
+		})
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			if value != runtime.NewInt(7) {
+				t.Fatalf("expected hook value 7, got %v", value)
+			}
+
+			order = append(order, "pre2")
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if value != runtime.NewInt(7) {
+				t.Fatalf("expected hook value 7, got %v", value)
+			}
+
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			order = append(order, "post")
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewInt(7))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), ferretmsgpack.Default, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		assertValueEqual(t, decoded, runtime.NewInt(7))
+
+		expectedOrder := []string{"pre1", "pre2", "post"}
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("post_hooks_receive_encode_errors", func(t *testing.T) {
+		var postErr error
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PostHook(func(_ context.Context, _ runtime.Value, err error) error {
+			postErr = err
+
+			return nil
+		})
+
+		_, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), &badValue{Fn: func() {}})
+		if err == nil {
+			t.Fatal("expected encode error")
+		}
+
+		if postErr == nil {
+			t.Fatal("expected post hook to receive encode error")
+		}
+
+		if postErr.Error() != err.Error() {
+			t.Fatalf("expected post hook error %q, got %q", err, postErr)
+		}
+	})
+
+	t.Run("nested_hooks_run_depth_first", func(t *testing.T) {
+		var order []string
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			order = append(order, "pre:"+hookValueLabel(value))
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			order = append(order, "post:"+hookValueLabel(value))
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewObjectWith(map[string]runtime.Value{
+			"items": runtime.NewArrayWith(runtime.NewString("leaf")),
+		}))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), ferretmsgpack.Default, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		expectedValue := runtime.NewObjectWith(map[string]runtime.Value{
+			"items": runtime.NewArrayWith(runtime.NewString("leaf")),
+		})
+
+		assertValueEqual(t, decoded, expectedValue)
+
+		expectedOrder := []string{
+			"pre:map",
+			"pre:list",
+			"pre:string:leaf",
+			"post:string:leaf",
+			"post:list",
+			"post:map",
+		}
+
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("range_hooks_run_for_items", func(t *testing.T) {
+		var order []string
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			order = append(order, "pre:"+hookValueLabel(value))
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			order = append(order, "post:"+hookValueLabel(value))
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewRange(1, 2))
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		decoded, err := ferretencoding.DecodeBytes(t.Context(), ferretmsgpack.Default, out)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		assertValueEqual(t, decoded, runtime.NewArrayWith(runtime.NewInt(1), runtime.NewInt(2)))
+
+		expectedOrder := []string{
+			"pre:1..2",
+			"pre:1",
+			"post:1",
+			"pre:2",
+			"post:2",
+			"post:1..2",
+		}
+
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("ancestor_post_hooks_receive_descendant_errors", func(t *testing.T) {
+		var postOrder []string
+		var postErrs []string
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			postOrder = append(postOrder, hookValueLabel(value))
+
+			if err == nil {
+				postErrs = append(postErrs, "")
+			} else {
+				postErrs = append(postErrs, err.Error())
+			}
+
+			return nil
+		})
+
+		_, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewObjectWith(map[string]runtime.Value{
+			"items": runtime.NewArrayWith(&badValue{Fn: func() {}}),
+		}))
+		if err == nil {
+			t.Fatal("expected encode error")
+		}
+
+		expectedOrder := []string{"bad", "list", "map"}
+		if !reflect.DeepEqual(postOrder, expectedOrder) {
+			t.Fatalf("expected post hook order %#v, got %#v", expectedOrder, postOrder)
+		}
+
+		if len(postErrs) != len(expectedOrder) {
+			t.Fatalf("expected %d post hook errors, got %d", len(expectedOrder), len(postErrs))
+		}
+
+		for i, hookErr := range postErrs {
+			if hookErr != err.Error() {
+				t.Fatalf("expected hook %d to receive %q, got %q", i, err, hookErr)
+			}
+		}
+	})
+
+	t.Run("fallback_root_hooks_run_once", func(t *testing.T) {
+		special := &iterOnly{items: []runtime.Value{runtime.NewString("leaf")}}
+		value := nestedArrayWithLeaf(32_768, special)
+
+		preCalls := 0
+		postCalls := 0
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, value runtime.Value) error {
+			if value == special {
+				preCalls++
+			}
+
+			return nil
+		})
+		config.PostHook(func(_ context.Context, value runtime.Value, err error) error {
+			if value == special {
+				postCalls++
+			}
+
+			if err != nil {
+				t.Fatalf("expected successful encode, got %v", err)
+			}
+
+			return nil
+		})
+
+		out, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), value)
+		if err != nil {
+			t.Fatalf("encode failed: %v", err)
+		}
+
+		if len(out) == 0 {
+			t.Fatal("expected encoded output")
+		}
+
+		if preCalls != 1 {
+			t.Fatalf("expected fallback root pre-hook once, got %d", preCalls)
+		}
+
+		if postCalls != 1 {
+			t.Fatalf("expected fallback root post-hook once, got %d", postCalls)
+		}
+	})
+
+	t.Run("configured_encoder_does_not_mutate_default", func(t *testing.T) {
+		calls := 0
+
+		config := ferretmsgpack.Default.EncodeWith()
+		config.PreHook(func(_ context.Context, _ runtime.Value) error {
+			calls++
+
+			return nil
+		})
+
+		if _, err := ferretencoding.EncodeBytes(t.Context(), config.Encoder(), runtime.NewInt(1)); err != nil {
+			t.Fatalf("configured encode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected configured encoder to invoke hook once, got %d", calls)
+		}
+
+		if _, err := ferretencoding.EncodeBytes(t.Context(), ferretmsgpack.Default, runtime.NewInt(2)); err != nil {
+			t.Fatalf("default encode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected default encoder to stay unmodified, got %d hook calls", calls)
+		}
+	})
+}
+
+func TestMsgpackCodecIntegerBoundaries(t *testing.T) {
+	codec := ferretmsgpack.Default
+
+	for _, input := range []int64{
+		math.MinInt64,
+		math.MinInt32 - 1,
+		math.MinInt32,
+		math.MinInt32 + 1,
+		-1, 0, 1,
+		math.MaxInt32 - 1,
+		math.MaxInt32,
+		math.MaxInt32 + 1,
+		math.MaxUint32,
+		math.MaxUint32 + 1,
+		1<<53 + 1,
+		math.MaxInt64,
+	} {
+		t.Run(strconv.FormatInt(input, 10), func(t *testing.T) {
+			assertDecodedInt := func(t *testing.T, data []byte) {
+				t.Helper()
+
+				value, err := ferretencoding.DecodeBytes(t.Context(), codec, data)
+				if err != nil {
+					t.Fatalf("decode failed: %v", err)
+				}
+
+				if value != runtime.NewInt64(input) {
+					t.Fatalf("decoded value = %v (%T), want Int(%d)", value, value, input)
+				}
+			}
+
+			t.Run("signed", func(t *testing.T) {
+				assertDecodedInt(t, mustEncodeRaw(t, func(enc *vmmsgpack.Encoder) error {
+					return enc.EncodeInt64(input)
+				}))
+			})
+
+			if input >= 0 {
+				t.Run("unsigned", func(t *testing.T) {
+					assertDecodedInt(t, mustEncodeRaw(t, func(enc *vmmsgpack.Encoder) error {
+						return enc.EncodeUint64(uint64(input))
+					}))
+				})
+			}
+
+			t.Run("roundtrip", func(t *testing.T) {
+				data, err := ferretencoding.EncodeBytes(t.Context(), codec, runtime.NewInt64(input))
+				if err != nil {
+					t.Fatalf("encode failed: %v", err)
+				}
+
+				assertDecodedInt(t, data)
+			})
+		})
+	}
+}
+
+func TestMsgpackCodecDecode(t *testing.T) {
+	codec := ferretmsgpack.Default
+	ctx := context.Background()
+
+	t.Run("none", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, nil))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if value != runtime.None {
+			t.Fatalf("expected None, got %T", value)
+		}
+	})
+
+	t.Run("boolean", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, true))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if value != runtime.True {
+			t.Fatalf("expected True, got %T", value)
+		}
+	})
+
+	t.Run("string", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, "hello"))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if value != runtime.NewString("hello") {
+			t.Fatalf("expected hello, got %v", value)
+		}
+	})
+
+	t.Run("int", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, 1))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if _, ok := value.(runtime.Int); !ok {
+			t.Fatalf("expected Int, got %T", value)
+		}
+	})
+
+	t.Run("float", func(t *testing.T) {
+		for _, input := range []float64{1.5, math.MaxInt32 + 1, 1 << 53} {
+			t.Run(strconv.FormatFloat(input, 'g', -1, 64), func(t *testing.T) {
+				value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, input))
+				if err != nil {
+					t.Fatalf("decode failed: %v", err)
+				}
+
+				if value != runtime.NewFloat(input) {
+					t.Fatalf("decoded value = %v (%T), want Float(%v)", value, value, input)
+				}
+			})
+		}
+	})
+
+	t.Run("binary", func(t *testing.T) {
+		data := []byte("hello")
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, data))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		if _, ok := value.(runtime.Binary); !ok {
+			t.Fatalf("expected Binary, got %T", value)
+		}
+
+		assertValueEqual(t, value, runtime.NewBinary(data))
+	})
+
+	t.Run("datetime", func(t *testing.T) {
+		ts := time.Date(2024, time.January, 2, 3, 4, 5, 6, time.UTC)
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, ts))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		assertValueEqual(t, value, runtime.NewDateTime(ts))
+	})
+
+	t.Run("nested", func(t *testing.T) {
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, mustMarshalNative(t, map[string]any{
+			"a": 1,
+			"b": []any{true, nil, "x"},
+		}))
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		obj, ok := value.(*runtime.Object)
+		if !ok {
+			t.Fatalf("expected Object, got %T", value)
+		}
+
+		a, err := obj.Get(ctx, runtime.NewString("a"))
+		if err != nil {
+			t.Fatalf("get a failed: %v", err)
+		}
+
+		if a != runtime.NewInt(1) {
+			t.Fatalf("expected 1, got %v", a)
+		}
+
+		b, err := obj.Get(ctx, runtime.NewString("b"))
+		if err != nil {
+			t.Fatalf("get b failed: %v", err)
+		}
+
+		arr, ok := b.(*runtime.Array)
+		if !ok {
+			t.Fatalf("expected Array, got %T", b)
+		}
+
+		item, err := arr.At(ctx, 0)
+		if err != nil {
+			t.Fatalf("array at 0 failed: %v", err)
+		}
+
+		if item != runtime.True {
+			t.Fatalf("expected true, got %v", item)
+		}
+
+		item, err = arr.At(ctx, 1)
+		if err != nil {
+			t.Fatalf("array at 1 failed: %v", err)
+		}
+
+		if item != runtime.None {
+			t.Fatalf("expected none, got %v", item)
+		}
+	})
+
+	t.Run("non_string_map_keys_normalize", func(t *testing.T) {
+		data := mustEncodeRaw(t, func(enc *vmmsgpack.Encoder) error {
+			if err := enc.EncodeMapLen(2); err != nil {
+				return err
+			}
+			if err := enc.EncodeInt(1); err != nil {
+				return err
+			}
+			if err := enc.EncodeString("one"); err != nil {
+				return err
+			}
+			if err := enc.EncodeBool(true); err != nil {
+				return err
+			}
+			return enc.EncodeString("yes")
+		})
+
+		value, err := ferretencoding.DecodeBytes(t.Context(), codec, data)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		obj, ok := value.(*runtime.Object)
+		if !ok {
+			t.Fatalf("expected Object, got %T", value)
+		}
+
+		one, err := obj.Get(ctx, runtime.NewString("1"))
+		if err != nil {
+			t.Fatalf("get 1 failed: %v", err)
+		}
+		assertValueEqual(t, one, runtime.NewString("one"))
+
+		yes, err := obj.Get(ctx, runtime.NewString("true"))
+		if err != nil {
+			t.Fatalf("get true failed: %v", err)
+		}
+		assertValueEqual(t, yes, runtime.NewString("yes"))
+	})
+
+	t.Run("unsigned_overflow_error", func(t *testing.T) {
+		for _, input := range []uint64{uint64(math.MaxInt64) + 1, math.MaxUint64} {
+			t.Run(strconv.FormatUint(input, 10), func(t *testing.T) {
+				data := mustEncodeRaw(t, func(enc *vmmsgpack.Encoder) error {
+					return enc.EncodeUint64(input)
+				})
+
+				value, err := ferretencoding.DecodeBytes(t.Context(), codec, data)
+				wantErr := "msgpack: integer " + strconv.FormatUint(input, 10) + " exceeds runtime range"
+				if err == nil || err.Error() != wantErr {
+					t.Fatalf("decode error = %v, want %q", err, wantErr)
+				}
+
+				if value != runtime.None {
+					t.Fatalf("decoded value = %v (%T), want None", value, value)
+				}
+			})
+		}
+	})
+
+	t.Run("empty_input_error", func(t *testing.T) {
+		_, err := ferretencoding.DecodeBytes(t.Context(), codec, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("invalid_msgpack_error", func(t *testing.T) {
+		_, err := ferretencoding.DecodeBytes(t.Context(), codec, []byte{0xc1})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("multiple_roots_error", func(t *testing.T) {
+		data := append(mustMarshalNative(t, 1), mustMarshalNative(t, 2)...)
+
+		_, err := ferretencoding.DecodeBytes(t.Context(), codec, data)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestMsgpackCodecDecodeHooks(t *testing.T) {
+	t.Run("hooks_run_in_order", func(t *testing.T) {
+		input := mustMarshalNative(t, map[string]any{"a": 1})
+		var order []string
+
+		config := ferretmsgpack.Default.DecodeWith()
+		config.PreHook(func(ctx context.Context) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			order = append(order, "pre1")
+
+			return nil
+		})
+		config.PreHook(func(ctx context.Context) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			order = append(order, "pre2")
+
+			return nil
+		})
+		config.PostHook(func(ctx context.Context, _ runtime.Value, err error) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			if err != nil {
+				t.Fatalf("expected successful decode, got %v", err)
+			}
+
+			order = append(order, "post")
+
+			return nil
+		})
+
+		value, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), input)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+
+		expectedValue := runtime.NewObjectWith(map[string]runtime.Value{
+			"a": runtime.NewInt(1),
+		})
+
+		assertValueEqual(t, value, expectedValue)
+
+		expectedOrder := []string{"pre1", "pre2", "post"}
+		if !reflect.DeepEqual(order, expectedOrder) {
+			t.Fatalf("expected hook order %#v, got %#v", expectedOrder, order)
+		}
+	})
+
+	t.Run("post_hooks_receive_decode_errors", func(t *testing.T) {
+		input := []byte{0xc1}
+		var postErr error
+
+		config := ferretmsgpack.Default.DecodeWith()
+		config.PostHook(func(ctx context.Context, _ runtime.Value, err error) error {
+			if ctx != t.Context() {
+				t.Fatal("hook lost caller context")
+			}
+
+			postErr = err
+
+			return nil
+		})
+
+		_, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), input)
+		if err == nil {
+			t.Fatal("expected decode error")
+		}
+
+		if postErr == nil {
+			t.Fatal("expected post hook to receive decode error")
+		}
+
+		if postErr.Error() != err.Error() {
+			t.Fatalf("expected post hook error %q, got %q", err, postErr)
+		}
+	})
+
+	t.Run("configured_decoder_does_not_mutate_default", func(t *testing.T) {
+		calls := 0
+
+		config := ferretmsgpack.Default.DecodeWith()
+		config.PreHook(func(_ context.Context) error {
+			calls++
+
+			return nil
+		})
+
+		if _, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), mustMarshalNative(t, 1)); err != nil {
+			t.Fatalf("configured decode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected configured decoder to invoke hook once, got %d", calls)
+		}
+
+		if _, err := ferretencoding.DecodeBytes(t.Context(), ferretmsgpack.Default, mustMarshalNative(t, 1)); err != nil {
+			t.Fatalf("default decode failed: %v", err)
+		}
+
+		if calls != 1 {
+			t.Fatalf("expected default decoder to stay unmodified, got %d hook calls", calls)
+		}
+	})
+
+	t.Run("pre_hook_error_short_circuits", func(t *testing.T) {
+		expectedErr := errors.New("stop")
+
+		config := ferretmsgpack.Default.DecodeWith()
+		config.PreHook(func(_ context.Context) error {
+			return expectedErr
+		})
+
+		_, err := ferretencoding.DecodeBytes(t.Context(), config.Decoder(), mustMarshalNative(t, 1))
+		if !errors.Is(err, expectedErr) {
+			t.Fatalf("expected %v, got %v", expectedErr, err)
+		}
+	})
+}

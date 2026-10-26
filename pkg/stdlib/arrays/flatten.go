@@ -1,0 +1,96 @@
+package arrays
+
+import (
+	"context"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// flatten turns an array of arrays into a flat array.
+// All array elements in array will be expanded in the result array.
+// Non-array elements are added as they are.
+// The function will recurse into sub-arrays up to the specified depth.
+// Duplicates will not be removed.
+// @param arr {Any[]} Target array.
+// @param depth {Int} Depth level.
+// @return {Any[]} Flat array.
+func Flatten(ctx context.Context, args ...runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgs(args, 1, 2); err != nil {
+		return runtime.None, err
+	}
+
+	if len(args) == 1 {
+		return flatten1(ctx, args[0])
+	}
+
+	return flatten2(ctx, args[0], args[1])
+}
+
+// flatten turns an array of arrays into a flat array.
+// All array elements in array will be expanded in the result array.
+// Non-array elements are added as they are.
+// The function will recurse into sub-arrays up to the specified depth.
+// Duplicates will not be removed.
+// @param arr {Any[]} Target array.
+// @return {Any[]} Flat array.
+func flatten1(ctx context.Context, arg1 runtime.Value) (runtime.Value, error) {
+	return flatten2(ctx, arg1, runtime.Int(1))
+}
+
+// flatten turns an array of arrays into a flat array.
+// All array elements in array will be expanded in the result array.
+// Non-array elements are added as they are.
+// The function will recurse into sub-arrays up to the specified depth.
+// Duplicates will not be removed.
+// @param arr {Any[]} Target array.
+// @param depth {Int} Depth level.
+// @return {Any[]} Flat array.
+func flatten2(ctx context.Context, arg1, arg2 runtime.Value) (runtime.Value, error) {
+	list, err := runtime.CastArg[runtime.List](arg1, 0)
+
+	if err != nil {
+		return runtime.None, err
+	}
+
+	size, err := list.Length(ctx)
+
+	if err != nil {
+		return runtime.None, err
+	}
+
+	level, err := runtime.CastArg[runtime.Int](arg2, 1)
+
+	if err != nil {
+		return runtime.None, err
+	}
+
+	var currentLevel runtime.Int
+	result := runtime.NewArray(runtime.CapacityHint(size, 2, 0))
+	var unwrap func(input runtime.List) error
+
+	unwrap = func(input runtime.List) error {
+		currentLevel++
+
+		return input.ForEach(ctx, func(c context.Context, value runtime.Value, idx runtime.Int) (runtime.Boolean, error) {
+			valueArr, ok := value.(runtime.List)
+
+			if !ok || currentLevel > level {
+				_ = result.Append(c, value)
+			} else {
+				if err := unwrap(valueArr); err != nil {
+					return false, err
+				}
+
+				currentLevel--
+			}
+
+			return true, nil
+		})
+	}
+
+	if err := unwrap(list); err != nil {
+		return runtime.None, err
+	}
+
+	return result, nil
+}

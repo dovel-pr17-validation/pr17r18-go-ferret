@@ -1,0 +1,30 @@
+package math_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/stdlib/math"
+
+	. "github.com/smartystreets/goconvey/convey"
+)
+
+func TestCeil(t *testing.T) {
+	Convey("Should return a value", t, func() {
+		out, err := math.Ceil(context.Background(), runtime.NewFloat(2.49))
+
+		So(err, ShouldBeNil)
+		So(out, ShouldEqual, 3)
+
+		out, err = math.Ceil(context.Background(), runtime.NewFloat(2.50))
+
+		So(err, ShouldBeNil)
+		So(out, ShouldEqual, 3)
+
+		out, err = math.Ceil(context.Background(), runtime.NewFloat(-2.50))
+
+		So(err, ShouldBeNil)
+		So(out, ShouldEqual, -2)
+	})
+}

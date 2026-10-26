@@ -1,0 +1,59 @@
+package sdktest_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/MontFerret/ferret/v2"
+	"github.com/MontFerret/ferret/v2/pkg/module"
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+	"github.com/MontFerret/ferret/v2/pkg/sdk"
+	"github.com/MontFerret/ferret/v2/pkg/sdk/sdktest"
+)
+
+func TestHarnessRunsExternalModuleAndCleansUp(t *testing.T) {
+	closed := false
+
+	t.Run("external module", func(t *testing.T) {
+		mod := sdk.NewModule("synthetic", func(bootstrap module.Bootstrap) error {
+			bootstrap.Hooks().Engine().OnClose(func() error {
+				closed = true
+				return nil
+			})
+
+			return sdk.RegisterFunctions(
+				bootstrap.Host().Library().Namespace("synthetic"),
+				sdk.Func("ADD", sdk.Bind2(func(
+					_ context.Context,
+					left runtime.Int,
+					right runtime.Int,
+				) (runtime.Value, error) {
+					return left + right, nil
+				})),
+			)
+		})
+
+		harness := sdktest.New(t, ferret.WithModules(mod))
+		if harness.Engine() == nil {
+			t.Fatal("expected harness engine")
+		}
+
+		handle, err := harness.Run(t.Context(), "RETURN synthetic::add(2, 3)")
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+
+		output, err := handle.Collect(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if string(output.Data) != "5" {
+			t.Fatalf("got output %s", output.Data)
+		}
+	})
+
+	if !closed {
+		t.Fatal("expected testing cleanup to close the engine")
+	}
+}

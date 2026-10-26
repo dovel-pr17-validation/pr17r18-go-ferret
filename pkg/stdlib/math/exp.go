@@ -1,0 +1,19 @@
+package math
+
+import (
+	"context"
+	"math"
+
+	"github.com/MontFerret/ferret/v2/pkg/runtime"
+)
+
+// exp returns Euler's constant (2.71828...) raised to the power of value.
+// @param number {Int | Float} Input number.
+// @return {Float} Euler's constant raised to the power of value.
+func Exp(_ context.Context, arg runtime.Value) (runtime.Value, error) {
+	if err := runtime.ValidateArgValue(arg, 0, runtime.AssertNumber); err != nil {
+		return runtime.None, err
+	}
+
+	return runtime.NewFloat(math.Exp(toFloat(arg))), nil
+}

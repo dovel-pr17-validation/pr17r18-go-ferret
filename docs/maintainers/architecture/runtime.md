@@ -1,0 +1,412 @@
+# Runtime and Lifecycle
+
+Ferret's runtime semantics are shared by compilation consumers, VM execution,
+the standard library, encoding, modules, and debugging. Keeping those semantics
+in their owning packages prevents different execution paths from disagreeing.
+
+## Runtime values
+
+`pkg/runtime` owns `runtime.Value` and the optional capability interfaces layered
+on it. A value supplies string representation, hashing, and shallow copying;
+additional interfaces opt into equality, ordering, iteration, querying,
+streaming, observability, dispatch, debugging, or resource behavior.
+
+Consumers should use the runtime's shared operations rather than matching
+concrete built-in types. Host values may implement capabilities without being a
+built-in value, and consumers must preserve those contracts.
+
+## Integer width
+
+Ferret `Int` is always signed 64-bit, independently of the host architecture.
+Do not use Go's native `int`, `strconv.Atoi`, or equivalent architecture-dependent
+conversions for values belonging to the Ferret value model. Parse those values
+with an explicit 64-bit width and use `NewInt64` for signed 64-bit sources.
+`Int.Unwrap()` returns Go `int64`; consumers must not assume Go `int`.
+
+Native `int` remains appropriate for indexes, lengths, capacities, registers,
+and internal collection offsets. Narrow a Ferret Int only at an API that
+requires it, after checking the host range unless the value is already
+structurally bounded. Return a Ferret error on an invalid mandatory size.
+An unrepresentable optional allocation hint may instead be omitted without
+restricting traversal. Check size arithmetic before conversion as well.
+
+Use `ToNativeInt(value)` for checked narrowing: it returns the exact Go `int`
+and `true`, or `0, false` when the value does not fit. It accepts negative
+integers; callers own domain restrictions and error attribution.
+
+Use `CapacityHint(length, multiplier, extra)` for optional allocation sizing.
+It checks `length*multiplier+extra` before native arithmetic, returning zero
+for overflow, negative length or extra, or a nonpositive multiplier. It performs
+no allocation. A zero hint does not validate a mandatory size, and a nonzero
+hint does not guarantee allocation success. Codec limits and calendar rules
+remain with their owning subsystems.
+
+See the [integer-width audit](integer-width-audit.md) for classifications and
+allocation API follow-ups.
+
+## Collection construction and migration
+
+`runtime.Factory[T Collection]` exposes `New(context.Context) (T, error)`.
+`List` embeds `Factory[List]`, and `Map` embeds `Factory[Map]`. This is an
+intentional breaking Go API change from `Spawnable[T].Empty`: implementers must
+rename the method and callers must use `New`. There is no compatibility alias.
+The generic constraint limits this capability to runtime collections.
+
+`New` creates an empty, independently mutable collection in the receiver's
+implementation family. Preserve relevant configuration such as backend,
+encoding, limits, and placement policy. A shared service or backend is allowed;
+shared logical mutable contents are not. The source remains unchanged and no
+elements are copied. Native Array may reserve capacity without populating it;
+FastObject preserves its shape cache and dictionary threshold, and DataSet
+preserves its distinctness policy with fresh membership state.
+
+`Copy` makes a shallow copy containing the elements; `Clone` makes a deep copy;
+`Clear` removes elements from the existing collection. None replaces `New`.
+Construction may perform I/O or fail and must honor the caller's context when
+it may block. Native factories reject pre-canceled calls before allocating.
+Ownership transfers only on success. A failed factory releases its partially
+acquired resources and joins creation and cleanup failures without returning an
+owned result. After successful creation, the caller owns cleanup until it
+transfers the result. Wrappers must implement `New` when an inherited factory
+would discard their implementation family or configuration.
+
+Canonical `collections::` functions, their deprecated global aliases, and
+iterator/result ownership are described in
+[Collection library contracts](../stdlib/collections.md).
+
+## Copying values
+
+Use `runtime.Copy(src)` when a caller needs a shallow copy preserving its static
+Go type, including capability interfaces such as `runtime.List`. The helper calls
+`Value.Copy` once and checks the result, returning an error wrapping
+`ErrInvalidType` with source and returned type details when the copy is
+incompatible. An interface copy may have a different concrete type if it still
+implements that interface. This check does not validate storage independence or
+change cloning and resource ownership; those remain the copy implementation's
+responsibility.
+
+Array bounds, shallow copy ownership, and independent slice backing storage are
+described in [Array library contracts](../stdlib/arrays.md).
+
+Map destination operations, immutable copies, and mutable object-library
+ownership are described in [Object library contracts](../stdlib/objects.md). Runtime iterator traversal
+closes acquired closable iterators and preserves both traversal and close errors;
+the iterable itself remains borrowed.
+
+## Equality, comparison, and hashing
+
+A hash is an acceleration hint, not proof of equality. Hash collisions are
+valid, so uniqueness, `DISTINCT`, set, grouping, and deduplication paths must
+verify equality after selecting candidates by hash.
+
+Shared runtime equality and comparison preserve Ferret's cross-type behavior,
+type ordering, fallible host comparisons, and context propagation. A value that
+implements both equality and ordering must keep those results consistent, and
+semantically equal values must produce equal hashes.
+
+Do not introduce a hash-only correctness path unless the contract is explicitly
+probabilistic. FQL collection semantics are not probabilistic.
+
+## VM execution
+
+`pkg/vm` executes `bytecode.Program` in a register file with frames, cells,
+catching, host-function dispatch, iterators, collectors, streams, and other
+execution state. The compiler owns emission; the VM owns the runtime meaning of
+the emitted instructions.
+
+Normal execution errors are returned as user-facing runtime errors with source
+context where possible. Internal invariant violations remain a distinct class.
+The VM's panic policy may recover runtime failures or propagate invariants, so
+new failure handling must preserve that distinction.
+
+The VM observes cancellation at its own safepoints. Context-aware host
+operations receive the execution context and are responsible for observing
+cancellation while they retain control.
+
+Tail replacement can shorten a register window while retaining its backing
+capacity. The VM's internal window pool scrubs and returns the full capacity
+when releasing that window, so repeated execution can reuse the original
+storage. Window storage never closes runtime resources; frame ownership and
+deferred cleanup retain that responsibility.
+
+Generic `COLLECT AGGREGATE` finalization emits `OpAggregateReduce(dst, list,
+kind)` for built-in one-argument reductions. Its immediate `AggregateKind`
+selects the same state update/finalization logic as fused collectors. The
+instruction borrows its collected list, checks cancellation during traversal,
+and preserves operation errors. Invalid internal inputs remain invariant
+violations; ordinary read errors use the existing recovery machinery. Protected
+selectors retain catch regions and `None` fallback. Empty-query guards and
+collector selection stay in the compiler. Public math registrations are not
+required for these reductions; namespaced selectors remain ordinary calls.
+
+## Resource ownership
+
+Runtime values may own closable resources. `runtime.Resource` adds a stable live
+resource identity to `io.Closer`; other comparable closers can also participate
+in VM tracking when their identity is safe to use.
+
+The VM tracks resource ownership and aliases through register and frame changes.
+Ownership must be transferred when a value escapes a frame or becomes a result,
+and discarded values must be closed exactly once. Cleanup must remain correct on
+normal return, runtime error, cancellation, recovery, unwind, and explicit close
+paths.
+
+Borrowed host parameters are not automatically owned by the VM. A change that
+copies, stores, returns, materializes, or aliases a resource must make the
+ownership transition explicit and preserve the caller's lifecycle.
+
+Avoid eager materialization of lazy, iterable, streaming, or resource-backed
+values unless the public contract requires it.
+
+## Results and materialization
+
+`vm.Result` holds the root runtime value and closers transferred from execution.
+Callers must close it. `Root` supports low-level inspection while the result is
+open; `vm.Materialize` performs a terminal ownership-aware conversion.
+
+A result can be materialized at most once, including when the materializer
+fails. Materializers may return additional closers or explicitly adopt values
+discovered during traversal. The result remains responsible for those resources
+until `Close`.
+
+The native engine uses this mechanism to produce detached `encoding.Content`, also exposed
+through the root embedding façade.
+Encoders can discover nested resources during traversal, so encoding failures and
+missing-codec failures must still close all resources already owned or adopted.
+
+## Engine, plan, and session lifecycle
+
+`pkg/engine` owns the native lifecycle implementation; root `ferret` aliases its
+public embedding types. Native Ferret protects object integrity; callers
+orchestrate object lifetime:
+
+* `Engine` owns the configured host, compilers, loader, module hooks, session
+  limiter, filesystem, and any network service it created.
+* `Plan` owns one compiled program, plan/session hooks, and a bounded or
+  unbounded pool of VMs for that program.
+* `Session` owns native run admission, before/after-run hooks, and output/error
+  decisions. Its internal `session.Execution` owns the borrowed VM, environment,
+  logging, encoding, filesystem and network references, materialization, and
+  cleanup. By default it borrows the engine filesystem.
+  `ferret.WithSessionFSRoot` replaces only that session's root while retaining
+  the engine's read-only policy; the session owns and closes the replacement
+  filesystem.
+
+Engine host-resource ownership is recorded in `pkg/engine/internal/resource.Manager`.
+The filesystem and Ferret-created networks are owned; `WithNetwork` explicitly
+borrows the caller's network. Each acquisition registers a callback that captures
+that resource instance. Replacing a named resource retires its previous owned
+callback immediately and records the replacement as the newest acquisition.
+Borrowed resources are never closed. A retirement error leaves the replacement
+registered, so construction rollback still cleans it up; retired callbacks are
+never retried.
+
+Failed option application or stdlib registration closes the configuration's
+manager. The native constructor also retains cleanup responsibility if public
+optimization-level translation fails. It then hands the manager to
+`pkg/engine/internal/bootstrap.Build`, which owns rollback for all returned
+construction errors and transfers ownership to Engine on success. Compiler and
+host-service construction failures close resources without close hooks. After
+host services are constructed, registration and host-build failures unwind the
+mutable hooks; initialization failures unwind the finalized hook snapshot.
+Construction panics propagate without error rollback, as before.
+On rollback or shutdown, eligible hooks run first, then the manager attempts
+every remaining owned callback in reverse acquisition/replacement order and
+joins cleanup errors.
+Consequently, default construction closes the network before the filesystem;
+a network created by an option is acquired earlier and closes after the
+filesystem. Bootstrap rollback and native Engine shutdown keep separate
+orchestration with the same cleanup ordering and error aggregation. Duplicate
+Engine closure retains the completed cleanup result. Both shutdown and bootstrap
+rollback wrap the close-hook aggregate once with `close hooks:` before joining
+resource failures; they do not also insert the unwrapped hook aggregate as a
+second cause. All original causes remain available through `errors.Is` and
+`errors.As`.
+
+Each ordinary or debug session has a separate host-resource manager, created
+after acquiring its limiter permit. It explicitly borrows the Engine filesystem
+and network. `WithSessionFSRoot` replaces only that manager's filesystem entry
+with an owned instance; Engine and sibling managers remain independent.
+The internal session acquisition owner constructs logging, acquires capacity,
+creates host resources and the environment, and constructs the VM or debugger
+session. Construction errors and panics close the untransferred manager without
+close hooks, with a separate defer retaining permit release even if resource
+cleanup panics. A successful build transfers both responsibilities to ordinary
+`Execution` or debugger services before the native cancellation recheck.
+Cancellation then closes the completed session through its normal cleanup path.
+
+Session close hooks precede host-resource cleanup, which precedes permit release
+and, for ordinary sessions, return of the borrowed VM. `Session.Close` marks the
+native object closed; `Execution.Close` owns this complete once-only sequence and
+caches its error for repeated and concurrent callers. Debugger closure still
+settles retained execution before closing the embedding session services.
+Those services keep their resource manager and acquired limiter permit private;
+their constructor does not transfer construction rollback. Debug services return
+the permit directly, while ordinary sessions also return a VM to the plan pool.
+Manager calls are serialized by construction and the owner's existing once-only
+shutdown. Managers have no independent synchronization or resource lookup API.
+VM resources, query-value cleanup, and limiter permits retain their separate
+lifecycle mechanisms.
+
+`Engine.Run` owns its temporary session and plan and closes them in that order
+before publishing the eager byte-backed output. Cleanup failures remain in the
+output's consumption outcome and its repeated Close result. Preparation failures
+roll back immediately and join cleanup errors with the admission error.
+A caller that creates children directly closes sessions before plans, and plans
+before the engine. Parents have no descendant registries. Ordinary execution
+owners cancel and settle `Run` before closing their session; debug closure
+terminates and settles active commands.
+
+Engine, Plan, and Session closure is concurrency-safe and idempotent, retaining
+the completed cleanup result. Engine uses an atomic closed flag; Plan uses one
+close channel for its closed state and capacity-waiter notification. Each owns
+its own once-only cleanup. Closed state becomes visible before close hooks run,
+and immutable program and host references remain intact during cleanup.
+
+Engine rejects new compilation and loading without waiting for admitted work.
+Plan rejects new sessions and wakes pending capacity acquisition without waiting
+for constructors. The session limiter observes the request context and that
+Plan's close channel, never Engine shutdown. Once capacity is acquired, parent
+closure does not roll back a constructed session. Ordinary construction may
+still fail if the VM pool closes before acquisition finishes; the pool owns that
+synchronization. A successfully returned session remains caller-owned.
+
+Hosts must settle outstanding work before closing resources used by their hooks
+or services. Native closure does not orchestrate graceful hierarchical shutdown.
+No admission lock spans options, hooks, or cleanup; a close hook must not
+recursively close its own object. `Session.Close` returns its VM to the pool;
+`Plan.Close` closes idle VMs, leaving borrowed VMs with sessions until returned.
+Engine and Plan cleanup continue even when a hook fails.
+
+Execution, compilation, and debugger context boundaries require non-nil contexts.
+Native engine/session admission rejects existing cancellation before Native options or hooks
+and rechecks request cancellation before returning constructed resources, closing
+them on cancellation. Raw VM execution retains its existing cancellation
+safepoints within an admitted run.
+
+`Compiler.Compile(ctx, src)` synchronously checks cancellation between parsing,
+lowering, and program construction; phases are not individually preempted. The
+context is required. Cancellation and deadline identities remain available
+through `errors.Is`, including when cancellation accompanies a Native option or hook
+failure.
+
+Native `PlanOption` and `SessionOption` target private native configurations,
+following the native `Option` pattern also aliased by root `ferret`. They are
+distinct from Universal API functional options. Non-nil options run once in
+order, joining validation errors before resource acquisition. The private
+session option target contains internal
+`session.Config`, which owns applied settings, defaults, and host-parameter
+conversion; native option constructors retain validation and ordering. Portable
+semantic data may be shared with the Universal API; portable option translation
+belongs in `uapi`, which produces Native options without changing their
+private targets.
+
+The [Universal adapter](universal-api.md) owns the Native engine created by `New` or
+borrows an existing engine through `Wrap`. Owned runtime close delegates to Native;
+borrowed runtime close is a no-op that leaves the wrapper usable. Plan and session
+close calls delegate to Native. Portable option callbacks run before delegation,
+independently of the operation context. Native receives the original caller context
+and owns context validation and cancellation. Portable session setters queue Native
+options; Native owns validation, conversion, and acquisition.
+Callers settle outstanding work, close sessions and plans, then close their owning
+runtime or the borrowed engine.
+
+`WithPlanOptimizationLevel` on `Engine.Compile` selects native None, Basic, or
+Full for one compilation. Omitting it inherits the engine's optimization;
+overrides do not mutate the engine default. Unsupported levels are rejected.
+`CompileDebug` accepts omission or None. Compiler instances remain immutable and
+safe for shared use.
+
+`Output`, `Content`, `Metadata`, and `Consumer` alias `api/result` types. Native
+`Session` owns preparation, VM admission, hooks, and outcome assembly. VM entry
+is the boundary after which terminal failures belong to output consumption.
+After-run hooks still precede encoding and receive the primary execution error.
+`Execution.MaterializeAndClose` returns detached content and separate encoding and
+result-cleanup errors, releasing the VM result before Run returns.
+
+The private native output owns detached bytes and consumption coordination, never
+a VM, temporary session, plan, or permit. Consume borrows its buffer synchronously;
+Collect transfers it directly. A lifecycle mutex orders admission, callback
+admission, explicit closure, and outcome commitment. Close cancels before waiting
+for callbacks and finalization, and returns only recorded cleanup failures.
+Metadata remains immutable and locally available after closure. Output.Close does
+not close a caller-created session. Settle an output before sequential reuse.
+
+Encoding borrows synchronous caller-owned I/O. Native materialization uses
+`encoding.EncodeBytes` with the original invocation context, collects writes
+into its own buffer, and transfers that buffer to Content. Custom encoders must
+not retain or close the supplied writer. Successful encoding records the actual
+media type and exact known length, including present-empty content. A nonempty
+prefix written before an encoding error remains available with unknown total
+length; a zero-byte failure means no content. Encoding failures remain separate
+from vm.Materialize's ownership conversion.
+See [codec I/O](codecs.md) for hooks, cancellation, buffering, and I/O ownership.
+See [consumable-output migration](consumable-output-migration.md) for context,
+closure, presence, and serialization contracts.
+
+Diagnostic aggregates expose `Unwrap() []error`, and runtime errors unwrap to
+their underlying diagnostic, which in turn retains its cause.
+When cleanup failures are joined alongside an attributed argument error,
+argument diagnostics retain the joined causes without changing their presentation.
+
+Before hooks run in registration order. After and close hooks unwind in reverse
+order, with the error behavior defined by `pkg/module` and the engine's internal
+host hook implementation. See [Modules, SDK, and standard library](modules.md).
+
+## Session randomness
+
+Every ordinary Session owns a `rnd.Source` through its internal execution;
+every native debug Session owns one through its debug services. Sources are
+independent of pooled VMs, Engine/Plan state, and resource managers. They require
+no cleanup or synchronization. Context extension attaches the source after
+before-run hooks, overriding any caller-provided source. Sequential runs and
+debugger resumes advance the existing sequence instead of reseeding it.
+
+`ferret.WithSessionRandomSeed(seed int64)` selects a deterministic sequence for
+an ordinary or debug Session. Zero and negative seeds are supported; the last
+option wins and reusing an option creates independent sources. An unseeded source
+reads operating-system entropy once, on its first actual draw. Construction,
+context lookup, invalid arguments, equal canonical bounds, and empty or singleton
+`random::choice`/`random::shuffle` inputs do not initialize it. Each source embeds
+Go's math/rand/v2 PCG; explicit seeds initialize its two
+words as `uint64(seed)` and zero without reading entropy. No host RNG injection
+or query-level seed mutation is exposed.
+
+Reproducibility is guaranteed within a Ferret version for the same inputs and
+executed control flow. Canonical random functions, deprecated global `rand`,
+and WAITFOR jitter consume this sequence in VM order. Seeding does not make
+external I/O or timing deterministic; different polling attempts consume
+different numbers of jitter draws. Direct stdlib/VM users must attach an owned
+source with `rnd.WithContext`. Lookup never creates a fallback; a random
+operation without a source reports `runtime.ErrUnexpected`.
+
+## Performance-sensitive boundaries
+
+The VM dispatch loop, register and frame operations, runtime comparison,
+collection operations, resource tracking, result materialization, pooling, and
+compiler-generated execution shape are performance-sensitive. Changes should be
+measured with the relevant unit or integration benchmark before and after the
+implementation.
+
+Debugger hooks on normal execution paths must remain cheap to bypass. Encoding
+and inspection should avoid repeated traversal or allocation without weakening
+ownership correctness.
+
+## Testing
+
+Use `pkg/runtime` tests for value and capability contracts, `pkg/vm` tests for
+instruction execution and ownership transitions, `pkg/engine` tests for native
+Engine/Plan/Session lifecycle and output behavior, and root tests for the curated
+public façade. Cross-layer semantics should also have coverage in
+`test/integration/vm` or the relevant compiler/optimization suite.
+
+Resource tests should cover aliases, borrowed versus owned values, failure,
+cancellation, unwind, materialization, and idempotent cleanup. Performance work
+should use the commands described in [Development workflow](../engineering/workflow.md).
+
+## Related guides
+
+* [Architecture](overview.md)
+* [Debugger architecture](debugger.md)
+* [Modules, SDK, and standard library](modules.md)
+* [Development workflow](../engineering/workflow.md)

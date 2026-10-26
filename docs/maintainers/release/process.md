@@ -1,0 +1,140 @@
+# Release Automation
+
+This repository defines post-release automation for Ferret Core. It does not
+define the release-creation or binary-packaging process for the separate
+MontFerret CLI product.
+
+Published GitHub releases with v2 tags trigger three independent workflows:
+
+```text
+published v2 release
+    |-> notify dependent source repositories
+    |-> notify the website to open a version update pull request
+    \-> publish versioned Ferret Core API artifacts
+```
+
+The dependent notification and API publication workflows also support explicitly
+validated manual dispatches. Website-version recovery is owned by the website's
+workflow. The YAML definitions are the authority for accepted inputs,
+permissions, target repositories, and event payloads.
+
+## Dependent repository notification
+
+`.github/workflows/notify-dependents.yml` validates a v2 SemVer tag and either a
+single allowed dependent repository or the complete configured set. Validation
+finishes before authentication or dispatch.
+
+For each selected repository, the workflow creates a repository-scoped GitHub
+App token with content-write permission and sends a `repository_dispatch` event
+named `ferret-core-released`. The payload contains the validated release version.
+Each target repository owns its response to that event.
+
+The configured repository names and event literal are security- and
+compatibility-sensitive. Keep validation, the target allowlist, token scope, and
+payload construction together. Do not accept arbitrary repository names, log
+tokens or private keys, or include rejected raw input in downstream requests.
+
+The matrix does not fail fast, so notification results remain visible for every
+dependent. A failed dispatch must fail that matrix job rather than being reported
+as a successful notification.
+
+## Website version notification
+
+`.github/workflows/notify-website.yml` handles published v2 releases separately
+from dependent source repositories. It passes the release tag, canonical release
+URL, and tagged commit SHA to the organization-owned
+`notify-website-release.yml` reusable workflow, together with the existing
+Ferret Release GitHub App credentials.
+
+The shared workflow validates the release metadata before authentication and
+sends the fixed `ferret-release-published` event to
+`MontFerret/montferret.github.io`. The website owns the repository-to-product
+mapping, version comparison, `data/versions.yaml` edit, automation branch, and
+pull request. Ferret must not check out or mutate the website repository, create
+the website pull request directly, or send this event through the dependent
+repository notification matrix.
+
+The Ferret caller is automatic only. To recover a missed release, manually run
+the website repository's `Update release version` workflow with the source
+repository, release tag, canonical release URL, and tagged commit SHA. The
+website updater advances directly to the requested version, so intermediate
+missed releases do not require separate pull requests.
+
+## Core API artifact publication
+
+`.github/workflows/publish-core-api.yml` validates that its v2 SemVer tag names a
+published, non-draft GitHub release. It then checks out the exact release tag and
+generates two deterministic artifacts from that source:
+
+* the callable API Reference;
+* the sibling presentation Catalog.
+
+The generator is the independent `tools/apiref` module. The registrations in
+`stdlib.Full()` are the callable API authority; the generator's source analyzer
+resolves and validates the structured documentation associated with those
+registrations. Ferret pins the shared artifact contracts in the tool module,
+not in the root runtime module.
+
+Detailed authoring, local generation, validation, and wire-contract rules live
+in the [Core API artifact maintainer guide](../reference/core-api.md).
+
+## Immutable `gh-pages` publication
+
+After generation, the workflow checks out the existing `gh-pages` branch into a
+separate worktree and invokes `scripts/publish-core-api.sh`. The script requires:
+
+* existing reference and catalog files;
+* a clean Git worktree for the Pages branch;
+* a non-empty version in the reference;
+* a publication that produces staged changes.
+
+The script runs the independent `tools/apipublish` module, then commits only the
+discovery index and the versioned `api.json` and `catalog.json` paths. Publication
+preserves immutable version history and pushes the explicit branch ref. It does
+not use Barn, modify the release tag checkout, or write partial artifacts when
+validation fails.
+
+`publish-core-api.yml` and the benchmark workflow both write to `gh-pages`. They
+share the `gh-pages-writer` concurrency group with cancellation disabled so one
+writer cannot discard another writer's completed history.
+
+## Security and failure boundaries
+
+Release workflows should keep event names as fixed literals and validate
+user-controlled tags and target repositories before using credentials. Use the
+minimum token permissions and repository scope required by each operation. Never
+print GitHub App private keys, access tokens, authorization headers, or other
+credential-bearing values.
+
+The automatic dependent notification path runs only for a published release
+event. Its manual recovery path validates tag syntax and the target allowlist
+but does not query GitHub to confirm that the supplied tag is published. The
+website notification caller has no manual path; recovery uses the website-owned
+workflow described above. In contrast, manual API publication explicitly
+verifies the published, non-draft release before checking out the tag. Keep
+these distinctions visible when changing any release flow.
+
+Recovery paths must not silently overwrite divergent history or treat partial
+publication as success.
+
+Artifact generation and validation complete before the publisher stages or
+pushes files. The Pages worktree must begin clean, and no-op publication is an
+error rather than evidence that a new version was published.
+
+## Documentation synchronization
+
+Public language, embedding, SDK, and standard-library behavior is documented in
+the website repository. Changes to public behavior should update the relevant
+website documentation in the same task when that checkout is available. If it
+is unavailable, record the specific required follow-up.
+
+The API Reference and Catalog are generated from registered code and structured
+source documentation. They complement, but do not replace, explanatory website
+documentation.
+
+## Related guides
+
+* [Architecture](../architecture/overview.md)
+* [Modules, SDK, and standard library](../architecture/modules.md)
+* [Development workflow](../engineering/workflow.md)
+* [Core API artifact maintainer guide](../reference/core-api.md)

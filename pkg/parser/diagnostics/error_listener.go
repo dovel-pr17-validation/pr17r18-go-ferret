@@ -1,0 +1,194 @@
+package diagnostics
+
+import (
+	"github.com/antlr4-go/antlr/v4"
+
+	"github.com/MontFerret/ferret/v2/pkg/parser/fql"
+	"github.com/MontFerret/ferret/v2/pkg/source"
+
+	"github.com/MontFerret/ferret/v2/pkg/diagnostics"
+)
+
+type ErrorListener struct {
+	*antlr.DiagnosticErrorListener
+	handler              *ErrorHandler
+	history              *TokenHistory
+	arrayLiterals        *arrayLiteralAnalysis
+	src                  source.Source
+	stopAfterSyntaxError bool
+}
+
+func NewErrorListener(src source.Source, handler *ErrorHandler, history *TokenHistory) antlr.ErrorListener {
+	return &ErrorListener{
+		DiagnosticErrorListener: antlr.NewDiagnosticErrorListener(false),
+		src:                     src,
+		handler:                 handler,
+		history:                 history,
+	}
+}
+
+func (d *ErrorListener) ReportAttemptingFullContext(recognizer antlr.Parser, dfa *antlr.DFA, startIndex, stopIndex int, conflictingAlts *antlr.BitSet, configs *antlr.ATNConfigSet) {
+}
+
+func (d *ErrorListener) ReportContextSensitivity(recognizer antlr.Parser, dfa *antlr.DFA, startIndex, stopIndex, prediction int, configs *antlr.ATNConfigSet) {
+}
+
+func (d *ErrorListener) ReportAmbiguity(recognizer antlr.Parser, dfa *antlr.DFA, startIndex, stopIndex int, exact bool, ambigAlts *antlr.BitSet, configs *antlr.ATNConfigSet) {
+	if recognizer == nil || dfa == nil || d.DiagnosticErrorListener == nil {
+		return
+	}
+
+	if ctx := recognizer.GetParserRuleContext(); ctx != nil {
+		for _, rule := range recognizer.GetRuleInvocationStack(ctx) {
+			switch rule {
+			case "expressionAtom", "functionStatement", "assignmentTarget", "limitClauseValue",
+				"collectClause", "collectGroupProjection":
+				return
+			}
+
+			if rule == "expression" && !exact && d.isCoalesceAmbiguity(recognizer, startIndex, stopIndex) {
+				return
+			}
+		}
+	}
+
+	d.DiagnosticErrorListener.ReportAmbiguity(recognizer, dfa, startIndex, stopIndex, exact, ambigAlts, configs)
+}
+
+// isCoalesceAmbiguity identifies the non-exact SLL conflict produced by the
+// right-associative expression alternative. Exact ambiguities remain errors.
+func (d *ErrorListener) isCoalesceAmbiguity(recognizer antlr.Parser, startIndex, stopIndex int) bool {
+	stream := recognizer.GetTokenStream()
+	if stream == nil || stream.Size() == 0 {
+		return false
+	}
+
+	start := startIndex
+	if ctx := recognizer.GetParserRuleContext(); ctx != nil && ctx.GetStart() != nil {
+		start = min(start, ctx.GetStart().GetTokenIndex())
+	}
+
+	start = max(0, start)
+	stop := min(stopIndex, stream.Size()-1)
+
+	for i := start; i <= stop; i++ {
+		if stream.Get(i).GetTokenType() == fql.FqlLexerCoalesce {
+			return true
+		}
+	}
+
+	for i := start - 1; i >= 0; i-- {
+		token := stream.Get(i)
+		if token.GetChannel() != antlr.TokenDefaultChannel {
+			continue
+		}
+
+		return token.GetTokenType() == fql.FqlLexerCoalesce
+	}
+
+	return false
+}
+
+func (d *ErrorListener) SyntaxError(recognizer antlr.Recognizer, offendingSymbol interface{}, line, column int, msg string, e antlr.RecognitionException) {
+	if d.stopAfterSyntaxError {
+		return
+	}
+
+	var offending antlr.Token
+
+	// Get offending token
+	if tok, ok := offendingSymbol.(antlr.Token); ok {
+		offending = tok
+	}
+
+	if !d.handler.HasErrorOnLine(line) {
+		if err := d.parseError(msg, offending, recognizer); err != nil {
+			d.handler.Add(err)
+			d.stopAfterSyntaxError = isCascadeStoppingSyntaxDiagnostic(err)
+		}
+	}
+}
+
+func (d *ErrorListener) parseError(msg string, offending antlr.Token, recognizer antlr.Recognizer) *diagnostics.Diagnostic {
+	span := spanFromTokenSafe(offending, d.src)
+
+	err := &diagnostics.Diagnostic{
+		Kind:    SyntaxError,
+		Source:  d.src,
+		Message: "Syntax error: " + msg,
+		Hint:    "Check your syntax. Did you forget to write something?",
+		Spans: []diagnostics.ErrorSpan{
+			{Span: span, Main: true},
+		},
+	}
+
+	node := analyzedTokenNode(d.history, offending)
+
+	analyzeSyntaxError(d.src, err, node, func(src source.Source, diagnostic *diagnostics.Diagnostic, token *TokenNode) bool {
+		if p, ok := recognizer.(antlr.Parser); ok {
+			if d.arrayLiterals == nil {
+				d.arrayLiterals = newArrayLiteralAnalysis(p.GetTokenStream())
+			}
+
+			if d.arrayLiterals != nil && d.arrayLiterals.match(src, diagnostic, p.GetParserRuleContext()) {
+				return true
+			}
+		}
+
+		return matchLiteralErrors(src, diagnostic, token)
+	})
+
+	return err
+}
+
+func analyzedTokenNode(history *TokenHistory, offending antlr.Token) *TokenNode {
+	var node *TokenNode
+	if history != nil {
+		node = cloneTokenChain(history.Last())
+	}
+
+	if node == nil {
+		if offending == nil {
+			return nil
+		}
+
+		return &TokenNode{token: offending}
+	}
+
+	if offending == nil || sameToken(node.token, offending) {
+		return node
+	}
+
+	offendingNode := &TokenNode{token: offending, prev: node}
+	node.next = offendingNode
+
+	return node
+}
+
+func cloneTokenChain(head *TokenNode) *TokenNode {
+	if head == nil {
+		return nil
+	}
+
+	clonedHead := &TokenNode{token: head.token}
+	clonedPrev := clonedHead
+
+	for curr := head.Prev(); curr != nil; curr = curr.Prev() {
+		cloned := &TokenNode{token: curr.token}
+		clonedPrev.prev = cloned
+		cloned.next = clonedPrev
+		clonedPrev = cloned
+	}
+
+	return clonedHead
+}
+
+func sameToken(a, b antlr.Token) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return a.GetTokenType() == b.GetTokenType() &&
+		a.GetStart() == b.GetStart() &&
+		a.GetStop() == b.GetStop()
+}
